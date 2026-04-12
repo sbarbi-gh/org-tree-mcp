@@ -247,7 +247,7 @@ First expr in item is the keyword (anchored with `.`).
 header args like `:tangle`); `@contents` is the block body.
 ```scheme
 (block
-  name: (expr) @_kw (#eq? @_kw "src")
+  name: (expr) @_kw (#match? @_kw "(?i)^src$")
   . parameter: (expr) @lang
   contents: (contents) @contents)
 ```
@@ -255,7 +255,7 @@ header args like `:tangle`); `@contents` is the block body.
 ## Source blocks filtered by language
 ```scheme
 (block
-  name: (expr) @_kw (#eq? @_kw "src")
+  name: (expr) @_kw (#match? @_kw "(?i)^src$")
   . parameter: (expr) @lang (#eq? @lang "python")
   contents: (contents) @contents)
 ```

@@ -107,6 +107,7 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
     let mut cursor = QueryCursor::new();
 
     let mut results = Vec::new();
+    let mut match_id = 0usize;
     let mut matches = cursor.matches(&query, tree.root_node(), source);
     while let Some(qmatch) = matches.next() {
         for capture in qmatch.captures {
@@ -118,6 +119,7 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
             }
             let text = node.utf8_text(source).unwrap_or("").to_string();
             results.push(QueryMatch {
+                match_id,
                 capture: name,
                 text,
                 range: byte_range(&node),
@@ -126,6 +128,7 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
                 breadcrumbs: breadcrumbs(node, source),
             });
         }
+        match_id += 1;
     }
     Ok(results)
 }

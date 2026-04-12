@@ -19,6 +19,11 @@ pub struct Position {
 /// A matched node returned by a query, with its location and ancestry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryMatch {
+    /// Index of the pattern match this capture belongs to.
+    /// All captures from the same match share the same match_id.
+    /// Use this to group @lang and @contents (or any multi-capture pattern)
+    /// without relying on row arithmetic.
+    pub match_id: usize,
     /// Capture name from the query pattern.
     pub capture: String,
     /// The text content of the matched node.

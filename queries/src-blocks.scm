@@ -14,6 +14,6 @@
 
 (block
   name: (expr) @_src_kw
-  (#eq? @_src_kw "src")
+  (#match? @_src_kw "(?i)^src$")
   . parameter: (expr) @lang
   contents: (contents) @contents)
