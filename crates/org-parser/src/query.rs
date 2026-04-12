@@ -105,6 +105,11 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
     let language = tree_sitter_org::language();
     let query = Query::new(&language, query_src).context("failed to compile query")?;
     let mut cursor = QueryCursor::new();
+    // Remove the default in-progress-match cap. When a pattern has multiple
+    // predicates on different captures (e.g. #eq? @lang + #match? @contents),
+    // tree-sitter tracks many partial matches simultaneously and silently drops
+    // results once the limit is hit. u32::MAX disables the cap.
+    cursor.set_match_limit(u32::MAX);
 
     let mut results = Vec::new();
     let mut match_id = 0usize;
@@ -129,6 +134,9 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
             });
         }
         match_id += 1;
+    }
+    if cursor.did_exceed_match_limit() {
+        eprintln!("warn: query match limit exceeded — results may be incomplete");
     }
     Ok(results)
 }
