@@ -1,47 +1,108 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Query, QueryCursor};
+use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 use crate::types::{ByteRange, HeadlineEntry, Position, QueryMatch};
 
-/// Walk a node's ancestors and collect headline titles, innermost last.
-fn breadcrumbs<'a>(node: Node<'a>, source: &[u8]) -> Vec<String> {
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn position(p: tree_sitter::Point) -> Position {
+    Position { row: p.row, column: p.column }
+}
+
+fn byte_range(n: &Node) -> ByteRange {
+    ByteRange { start: n.start_byte(), end: n.end_byte() }
+}
+
+/// Collect all `section` → `headline` ancestors of `node`, innermost last.
+fn breadcrumbs(node: Node, source: &[u8]) -> Vec<String> {
     let mut crumbs = Vec::new();
-    let mut current = node.parent();
-    while let Some(n) = current {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
         if n.kind() == "section" {
-            if let Some(headline) = n.child_by_field_name("headline") {
-                if let Some(item) = headline.child_by_field_name("item") {
+            if let Some(hl) = n.child_by_field_name("headline") {
+                if let Some(item) = hl.child_by_field_name("item") {
                     if let Ok(text) = item.utf8_text(source) {
                         crumbs.push(text.trim().to_string());
                     }
                 }
             }
         }
-        current = n.parent();
+        cur = n.parent();
     }
     crumbs.reverse();
     crumbs
 }
 
-fn position(p: tree_sitter::Point) -> Position {
-    Position { row: p.row, column: p.column }
+/// Split "TODO My headline" → (Some("TODO"), "My headline").
+fn split_keyword(title: &str) -> (Option<String>, String) {
+    const KW: &[&str] = &["TODO", "DONE", "NEXT", "WAITING", "CANCELLED"];
+    if let Some((first, rest)) = title.split_once(' ') {
+        if KW.contains(&first) {
+            return (Some(first.to_string()), rest.to_string());
+        }
+    }
+    (None, title.to_string())
 }
 
-fn range(n: &Node) -> ByteRange {
-    ByteRange { start: n.start_byte(), end: n.end_byte() }
+fn tags_from_headline<'a>(headline: Node<'a>, source: &[u8]) -> Vec<String> {
+    let Some(tag_list) = headline.child_by_field_name("tags") else {
+        return Vec::new();
+    };
+    let mut cursor = tag_list.walk();
+    tag_list
+        .children(&mut cursor)
+        .filter(|n| n.kind() == "tag")
+        .filter_map(|n| n.utf8_text(source).ok())
+        .map(String::from)
+        .collect()
 }
 
-/// Run an arbitrary tree-sitter S-expression query against parsed source.
-/// Returns one [`QueryMatch`] per capture per match.
-pub fn run_query(
-    source: &[u8],
-    tree: &tree_sitter::Tree,
-    query_src: &str,
-) -> Result<Vec<QueryMatch>> {
+// ── outline ───────────────────────────────────────────────────────────────────
+
+/// Recursively collect all headlines via direct AST traversal.
+fn collect_headlines(node: Node, source: &[u8], entries: &mut Vec<HeadlineEntry>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "section" {
+            if let Some(headline) = child.child_by_field_name("headline") {
+                let stars = headline
+                    .child_by_field_name("stars")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let item = headline.child_by_field_name("item");
+                if let Some(item_node) = item {
+                    let full = item_node.utf8_text(source).unwrap_or("").trim().to_string();
+                    let (keyword, title) = split_keyword(&full);
+                    entries.push(HeadlineEntry {
+                        depth: stars.len(),
+                        title,
+                        todo_keyword: keyword,
+                        tags: tags_from_headline(headline, source),
+                        range: byte_range(&child),
+                        start_position: position(headline.start_position()),
+                    });
+                }
+            }
+            collect_headlines(child, source, entries);
+        }
+    }
+}
+
+/// Return a flat ordered list of all headlines in the document.
+pub fn outline(source: &[u8], tree: &Tree) -> Result<Vec<HeadlineEntry>> {
+    let mut entries = Vec::new();
+    collect_headlines(tree.root_node(), source, &mut entries);
+    Ok(entries)
+}
+
+// ── run_query ─────────────────────────────────────────────────────────────────
+
+/// Execute an arbitrary tree-sitter S-expression query.
+/// Returns one [`QueryMatch`] per capture per pattern match.
+pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<QueryMatch>> {
     let language = tree_sitter_org::language();
-    let query = Query::new(&language, query_src)
-        .context("failed to compile query")?;
+    let query = Query::new(&language, query_src).context("failed to compile query")?;
     let mut cursor = QueryCursor::new();
 
     let mut results = Vec::new();
@@ -50,11 +111,15 @@ pub fn run_query(
         for capture in qmatch.captures {
             let node = capture.node;
             let name = query.capture_names()[capture.index as usize].to_string();
+            // Skip internal captures (prefixed with _) from results
+            if name.starts_with('_') {
+                continue;
+            }
             let text = node.utf8_text(source).unwrap_or("").to_string();
             results.push(QueryMatch {
                 capture: name,
                 text,
-                range: range(&node),
+                range: byte_range(&node),
                 start_position: position(node.start_position()),
                 end_position: position(node.end_position()),
                 breadcrumbs: breadcrumbs(node, source),
@@ -64,69 +129,95 @@ pub fn run_query(
     Ok(results)
 }
 
-/// Extract the document outline as a flat list of headlines.
-pub fn outline(source: &[u8], tree: &tree_sitter::Tree) -> Result<Vec<HeadlineEntry>> {
-    let query_src = r#"
-        (section
-          headline: (headline
-            stars: (stars) @stars
-            item: (item) @title
-            tags: (tag_list (tag) @tag)?))
-    "#;
-    let language = tree_sitter_org::language();
-    let query = Query::new(&language, query_src).context("outline query")?;
-    let mut cursor = QueryCursor::new();
+// ── get_subtree ───────────────────────────────────────────────────────────────
 
-    let stars_idx = query.capture_index_for_name("stars").unwrap();
-    let title_idx = query.capture_index_for_name("title").unwrap();
-    let tag_idx   = query.capture_index_for_name("tag").unwrap();
+/// Find a section node by walking a heading-title path, case-insensitive.
+/// `path` elements are matched against the cleaned title (keyword stripped).
+fn find_section_by_path<'a>(
+    root: Node<'a>,
+    source: &[u8],
+    path: &[String],
+) -> Option<Node<'a>> {
+    if path.is_empty() {
+        return None;
+    }
+    let target = path[0].to_lowercase();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "section" {
+            continue;
+        }
+        let title = child
+            .child_by_field_name("headline")
+            .and_then(|h| h.child_by_field_name("item"))
+            .and_then(|i| i.utf8_text(source).ok())
+            .map(|t| split_keyword(t.trim()).1.to_lowercase())
+            .unwrap_or_default();
 
-    let mut entries: Vec<HeadlineEntry> = Vec::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source);
-    while let Some(qmatch) = matches.next() {
-        let mut stars_text = "";
-        let mut title_node: Option<Node> = None;
-        let mut tags: Vec<String> = Vec::new();
-
-        for cap in qmatch.captures {
-            if cap.index == stars_idx {
-                stars_text = cap.node.utf8_text(source).unwrap_or("");
-            } else if cap.index == title_idx {
-                title_node = Some(cap.node);
-            } else if cap.index == tag_idx {
-                tags.push(cap.node.utf8_text(source).unwrap_or("").to_string());
+        if title.contains(&target) {
+            if path.len() == 1 {
+                return Some(child);
+            } else {
+                return find_section_by_path(child, source, &path[1..]);
             }
         }
-
-        if let Some(title) = title_node {
-            let full_title = title.utf8_text(source).unwrap_or("").trim().to_string();
-            let depth = stars_text.len();
-
-            // Strip leading TODO keyword if present
-            let (keyword, title_text) = split_keyword(&full_title);
-
-            entries.push(HeadlineEntry {
-                depth,
-                title: title_text,
-                todo_keyword: keyword,
-                tags,
-                range: range(&title),
-                start_position: position(title.start_position()),
-            });
-        }
     }
-    Ok(entries)
+    None
 }
 
-/// Split "TODO My headline" into (Some("TODO"), "My headline").
-fn split_keyword(title: &str) -> (Option<String>, String) {
-    const KEYWORDS: &[&str] = &["TODO", "DONE", "NEXT", "WAITING", "CANCELLED"];
-    let mut parts = title.splitn(2, ' ');
-    if let Some(first) = parts.next() {
-        if KEYWORDS.contains(&first) {
-            let rest = parts.next().unwrap_or("").to_string();
-            return (Some(first.to_string()), rest);
+/// Find the first section whose `:CUSTOM_ID:` property matches `id`.
+fn find_section_by_custom_id<'a>(root: Node<'a>, source: &[u8], id: &str) -> Option<Node<'a>> {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "section" {
+            continue;
+        }
+        // check property_drawer for CUSTOM_ID
+        if let Some(prop_drawer) = child.child_by_field_name("property_drawer") {
+            let mut pc = prop_drawer.walk();
+            for prop in prop_drawer.children(&mut pc) {
+                if prop.kind() != "property" {
+                    continue;
+                }
+                let name = prop
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let value = prop
+                    .child_by_field_name("value")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                if name.eq_ignore_ascii_case("CUSTOM_ID") && value.trim() == id {
+                    return Some(child);
+                }
+            }
+        }
+        // recurse into subsections
+        if let Some(found) = find_section_by_custom_id(child, source, id) {
+            return Some(found);
         }
     }
-    (None, title.to_string())
+    None
+}
+
+/// Return the raw org text of a subtree identified by a heading path or CUSTOM_ID.
+///
+/// Exactly one of `heading_path` or `custom_id` must be `Some`.
+pub fn get_subtree(
+    source: &[u8],
+    tree: &Tree,
+    heading_path: Option<&[String]>,
+    custom_id: Option<&str>,
+) -> Result<String> {
+    let node = match (heading_path, custom_id) {
+        (Some(path), None) => find_section_by_path(tree.root_node(), source, path),
+        (None, Some(id)) => find_section_by_custom_id(tree.root_node(), source, id),
+        _ => bail!("provide exactly one of heading_path or custom_id"),
+    };
+    match node {
+        Some(n) => Ok(std::str::from_utf8(&source[n.start_byte()..n.end_byte()])
+            .context("section text is not valid UTF-8")?
+            .to_string()),
+        None => bail!("section not found"),
+    }
 }

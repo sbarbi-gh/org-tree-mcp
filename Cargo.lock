@@ -343,9 +343,11 @@ dependencies = [
  "anyhow",
  "org-parser",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
+ "tree-sitter",
 ]
 
 [[package]]
