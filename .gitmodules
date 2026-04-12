@@ -1,0 +1,3 @@
+[submodule "grammar/tree-sitter-org"]
+	path = grammar/tree-sitter-org
+	url = git@github.com:sbarbi-gh/tree-sitter-org.git
