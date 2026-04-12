@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
 
@@ -131,17 +132,19 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
 
 // ── get_subtree ───────────────────────────────────────────────────────────────
 
-/// Find a section node by walking a heading-title path, case-insensitive.
-/// `path` elements are matched against the cleaned title (keyword stripped).
+/// Find a section node by walking a heading-title path.
+/// Each element of `path` is compiled as a case-insensitive regex and matched
+/// against the cleaned headline title (TODO keyword stripped).
 fn find_section_by_path<'a>(
     root: Node<'a>,
     source: &[u8],
     path: &[String],
-) -> Option<Node<'a>> {
+) -> Result<Option<Node<'a>>> {
     if path.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let target = path[0].to_lowercase();
+    let pat = Regex::new(&format!("(?i){}", path[0]))
+        .with_context(|| format!("invalid heading regex: {:?}", path[0]))?;
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() != "section" {
@@ -151,18 +154,18 @@ fn find_section_by_path<'a>(
             .child_by_field_name("headline")
             .and_then(|h| h.child_by_field_name("item"))
             .and_then(|i| i.utf8_text(source).ok())
-            .map(|t| split_keyword(t.trim()).1.to_lowercase())
+            .map(|t| split_keyword(t.trim()).1)
             .unwrap_or_default();
 
-        if title.contains(&target) {
+        if pat.is_match(&title) {
             if path.len() == 1 {
-                return Some(child);
+                return Ok(Some(child));
             } else {
                 return find_section_by_path(child, source, &path[1..]);
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Find the first section whose `:CUSTOM_ID:` property matches `id`.
@@ -210,7 +213,7 @@ pub fn get_subtree(
     custom_id: Option<&str>,
 ) -> Result<String> {
     let node = match (heading_path, custom_id) {
-        (Some(path), None) => find_section_by_path(tree.root_node(), source, path),
+        (Some(path), None) => find_section_by_path(tree.root_node(), source, path)?,
         (None, Some(id)) => find_section_by_custom_id(tree.root_node(), source, id),
         _ => bail!("provide exactly one of heading_path or custom_id"),
     };

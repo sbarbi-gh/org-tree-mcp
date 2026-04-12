@@ -28,7 +28,8 @@ struct SubtreeParams {
     /// Absolute path to the org file.
     file: String,
     /// Heading title path from root to target section, e.g. ["Results", "PCA"].
-    /// Matched case-insensitively as a substring. Use this OR custom_id.
+    /// Each element is a case-insensitive regex matched against the headline
+    /// title (TODO keyword stripped). Use this OR custom_id.
     heading_path: Option<Vec<String>>,
     /// Value of the :CUSTOM_ID: property of the target section.
     /// Use this OR heading_path.
@@ -90,8 +91,8 @@ impl OrgMcpServer {
     }
 
     /// Return the raw org text of a subtree identified by a heading path or
-    /// CUSTOM_ID property. heading_path elements are matched as
-    /// case-insensitive substrings of cleaned headline titles (TODO keyword
+    /// CUSTOM_ID property. Each heading_path element is a case-insensitive
+    /// regex matched against the cleaned headline title (TODO keyword
     /// stripped). Provide exactly one of heading_path or custom_id.
     #[tool(description = "Get the full org text of a subtree by heading path or CUSTOM_ID.")]
     async fn subtree(&self, Parameters(p): Parameters<SubtreeParams>) -> String {
