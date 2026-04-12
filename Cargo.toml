@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "grammar/tree-sitter-org",
+    "crates/org-parser",
+    "crates/mcp-server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tree-sitter = "0.25"
+tree-sitter-org = { path = "grammar/tree-sitter-org" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rmcp = { version = "1", features = ["server", "transport-io"] }
+streaming-iterator = "0.1"

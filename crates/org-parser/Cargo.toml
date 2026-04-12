@@ -1,0 +1,12 @@
+[package]
+name = "org-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = { workspace = true }
+tree-sitter-org = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+streaming-iterator = { workspace = true }
