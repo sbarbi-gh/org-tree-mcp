@@ -1,0 +1,105 @@
+#+TITLE: Research Notes — Membrane Dynamics
+#+AUTHOR: A. Researcher
+#+DATE: 2024-01-15
+#+FILETAGS: :biology:biophysics:
+
+* Background
+:PROPERTIES:
+:CUSTOM_ID: background
+:CREATED:  2024-01-10
+:END:
+
+Lipid bilayers form the structural basis of all cellular membranes. Their
+mechanical properties — bending rigidity, tension, and spontaneous curvature —
+govern a wide range of biological processes including endocytosis, exocytosis,
+and organelle morphogenesis.
+
+The Helfrich free energy functional provides the canonical framework for
+describing membrane elasticity:
+
+#+begin_src latex
+F = \int \left[ \frac{\kappa}{2}(2H - c_0)^2 + \bar{\kappa} K \right] dA
+#+end_src
+
+where $H$ is mean curvature, $K$ is Gaussian curvature, $\kappa$ is bending
+rigidity and $c_0$ is the spontaneous curvature.
+
+** Key Parameters                                                      :params:
+:PROPERTIES:
+:CUSTOM_ID: key-params
+:END:
+
+| Parameter    | Symbol     | Typical range       | Units       |
+|--------------+------------+---------------------+-------------|
+| Bending rig. | $\kappa$   | 10 -- 30            | $k_B T$     |
+| Tension      | $\sigma$   | $10^{-6}$ -- $10^{-3}$ | N/m      |
+| Spont. curv. | $c_0$      | -0.2 -- 0.2         | nm$^{-1}$  |
+
+* TODO Run simulations for asymmetric bilayers                      :simulation:
+SCHEDULED: <2024-02-01 Thu>
+:PROPERTIES:
+:CUSTOM_ID: sim-asymmetric
+:EFFORT:   4h
+:END:
+
+Need to sweep spontaneous curvature $c_0 \in [-0.3, 0.3]$ in steps of 0.05
+and record equilibrium shapes.
+
+** DONE Set up simulation environment
+CLOSED: [2024-01-18 Thu]
+
+Installed LAMMPS 23Jun2022, configured GPU acceleration.
+
+** TODO Write analysis pipeline                                      :coding:
+
+#+begin_src python :session mem :results silent
+import numpy as np
+import mdanalysis as mda
+
+def compute_mean_curvature(positions, box):
+    """Estimate mean curvature via the shape operator on a triangulated surface."""
+    # placeholder — triangulate membrane mid-surface first
+    pass
+#+end_src
+
+** TODO Validate against literature values                          :validation:
+
+Compare against Dimova 2014 (DOI: 10.1146/annurev-biophys-051013-022953).
+
+* DONE Literature Review                                              :reading:
+CLOSED: [2024-01-14 Sun]
+:PROPERTIES:
+:CUSTOM_ID: lit-review
+:CREATED:  2024-01-08
+:END:
+
+Covered the following papers:
+
+- Helfrich 1973 — original free-energy formulation
+- Evans & Rawicz 1990 — micropipette aspiration measurements
+- Dimova 2014 — review of GUV mechanics
+
+** Notes on Dimova 2014
+
+The review consolidates electroformation, osmotic deflation, and flicker
+spectroscopy as complementary methods.  Key tension: flicker spectroscopy
+underestimates $\kappa$ relative to micropipette by ~20%.
+
+* Meetings
+:PROPERTIES:
+:CUSTOM_ID: meetings
+:END:
+
+** <2024-01-17 Wed> Group meeting                                    :meeting:
+
+Presented preliminary phase diagram.  Feedback:
+
+1. Include error bars on bending rigidity estimates.
+2. Cross-check with coarse-grained MD (MARTINI force field).
+3. [X] Send updated figures to PI by Friday.
+4. [ ] Schedule follow-up with collaborator at ETH.
+
+** <2024-02-05 Mon> Collaborator call                               :meeting:
+SCHEDULED: <2024-02-05 Mon 14:00>
+
+Agenda TBD.

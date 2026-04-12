@@ -1,0 +1,134 @@
+#+TITLE: Literate Analysis — Signal Processing Notebook
+#+AUTHOR: A. Researcher
+#+PROPERTY: header-args:python :session analysis :exports both
+
+* Introduction
+
+This notebook implements a small signal-processing pipeline for electrophysiology
+recordings in literate style.  Each section combines prose, code, and results so
+that the analysis is fully reproducible from this single document.
+
+* Data Loading                                                         :setup:
+:PROPERTIES:
+:CUSTOM_ID: data-loading
+:END:
+
+Raw recordings are stored as HDF5 files.  The loader validates shape and
+sampling rate before returning a normalised array.
+
+#+begin_src python
+import numpy as np
+import h5py
+from pathlib import Path
+
+DATA_DIR = Path("data/raw")
+SAMPLE_RATE = 20_000  # Hz
+
+def load_recording(fname: str) -> np.ndarray:
+    with h5py.File(DATA_DIR / fname, "r") as f:
+        signal = f["signal"][:]
+        sr = f.attrs.get("sample_rate", SAMPLE_RATE)
+        assert sr == SAMPLE_RATE, f"unexpected sample rate {sr}"
+    return signal.astype(np.float64)
+#+end_src
+
+* Preprocessing                                                        :dsp:
+:PROPERTIES:
+:CUSTOM_ID: preprocessing
+:END:
+
+** Bandpass Filter
+
+A 4th-order Butterworth bandpass (300–3000 Hz) removes low-frequency drift and
+high-frequency noise while preserving spike waveforms.
+
+#+begin_src python
+from scipy.signal import butter, sosfiltfilt
+
+def bandpass(signal: np.ndarray, lo=300, hi=3000, fs=SAMPLE_RATE) -> np.ndarray:
+    sos = butter(4, [lo, hi], btype="band", fs=fs, output="sos")
+    return sosfiltfilt(sos, signal)
+#+end_src
+
+** Common-Average Reference
+
+Subtract the mean across all channels to suppress correlated noise.
+
+#+begin_src python
+def car(array: np.ndarray) -> np.ndarray:
+    """array shape: (n_channels, n_samples)"""
+    return array - array.mean(axis=0, keepdims=True)
+#+end_src
+
+* Spike Detection                                                      :dsp:
+:PROPERTIES:
+:CUSTOM_ID: spike-detection
+:END:
+
+Threshold crossings at $-4\,\sigma$ (negative-going) with a 1 ms refractory
+period.
+
+#+begin_src python
+def detect_spikes(signal: np.ndarray, threshold_sigma=4, refractory_ms=1.0) -> np.ndarray:
+    """Return sample indices of detected spike peaks."""
+    thr = -threshold_sigma * signal.std()
+    refractory = int(refractory_ms * 1e-3 * SAMPLE_RATE)
+
+    crossings = np.where((signal[:-1] >= thr) & (signal[1:] < thr))[0]
+    # enforce refractory period
+    kept = []
+    last = -refractory
+    for c in crossings:
+        if c - last >= refractory:
+            kept.append(c)
+            last = c
+    return np.array(kept)
+#+end_src
+
+#+RESULTS:
+
+* Results                                                          :results:
+:PROPERTIES:
+:CUSTOM_ID: results
+:END:
+
+** TODO Spike rate summary table                                      :pending:
+
+#+begin_src python
+# will populate once real data is available
+print("channel | n_spikes | mean_rate_hz")
+#+end_src
+
+#+RESULTS:
+: channel | n_spikes | mean_rate_hz
+
+** TODO PCA on spike waveforms                                        :pending:
+
+Use 32-sample windows centred on each detected peak.
+
+* Configuration
+:PROPERTIES:
+:CUSTOM_ID: config
+:END:
+
+#+begin_src python :exports none
+CONFIG = {
+    "bandpass_lo": 300,
+    "bandpass_hi": 3000,
+    "threshold_sigma": 4,
+    "refractory_ms": 1.0,
+    "window_samples": 32,
+}
+#+end_src
+
+* Notes
+:PROPERTIES:
+:CUSTOM_ID: notes
+:END:
+
+- [X] Confirm HDF5 layout with data acquisition team
+- [ ] Add unit tests for ~bandpass~ and ~detect_spikes~
+- [ ] Benchmark on 1-hour recording (~4 GB) to check memory usage
+
+[fn:1] Quiroga et al. 2004, /Neural Computation/ 16(8):1661–1687 — reference
+implementation for threshold-based spike sorting.

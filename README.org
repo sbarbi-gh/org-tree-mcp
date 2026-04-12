@@ -1,0 +1,175 @@
+#+TITLE: org-tree-mcp
+#+AUTHOR: Stefano Barbi
+
+* Overview
+
+~org-tree-mcp~ is an MCP (Model Context Protocol) server for navigating and
+editing Org mode files. It is designed so that AI agents can reliably explore
+large collections of Org documents, run structured queries against their
+content, and apply verified edits — without requiring a running Emacs instance.
+
+The server is built on [[https://github.com/milisims/tree-sitter-org][tree-sitter-org]], a tree-sitter grammar for Org mode.
+Tree-sitter provides a fast, robust, incremental parser that produces a
+concrete syntax tree for every Org file, making structural queries both
+precise and composable.
+
+* Design Principles
+
+** Structural, not textual
+
+Queries operate on the parsed syntax tree rather than raw text.  Headlines,
+sections, blocks, drawers, timestamps, tags, and properties are all
+first-class nodes.  This eliminates an entire class of fragile regex-over-lines
+approaches.
+
+** Hybrid query API
+
+The server exposes two complementary query interfaces:
+
+- *Predefined queries* — a curated, documented set of high-level operations for
+  the most common navigation tasks: document outline, section by heading,
+  headings matching a pattern, property lookups, tagged subtrees, blocks of a
+  given type, and more.  These require no knowledge of tree-sitter internals.
+
+- *Native tree-sitter queries* — full access to the S-expression query language
+  supported by tree-sitter, with documented examples covering the org grammar's
+  node types and fields.  This surface is appropriate when the predefined set
+  does not cover a particular need.
+
+** Verified patching
+
+All edits are expressed as patches against byte ranges derived from the syntax
+tree.  Before any patch is written to disk the server re-parses the would-be
+result and rejects the change if it introduces a syntax error.  The round-trip
+parse acts as a lightweight contract: the file on disk is always
+syntactically valid org.
+
+** Documented multi-stage workflow
+
+Complex editing tasks are decomposed into stages that an agent can follow
+explicitly:
+
+1. *Broad query* — retrieve an outline or section list to orient in the document.
+2. *Focus query* — narrow to a specific subtree, block, or property drawer.
+3. *Patch* — apply a targeted, verified edit to the focused region.
+
+Each stage is independently auditable, which makes the overall workflow both
+debuggable and resumable.
+
+* Use Cases
+
+- Navigating a library of literate programming notebooks (e.g.  Org-Babel
+  files) to locate, read, and update code blocks, results, or prose sections.
+- Scientific research workflows where notes, experiment logs, and analysis
+  scripts live together in Org documents and need to be queried or updated
+  programmatically.
+- Automated maintenance of large Org-based knowledge bases: bulk tag edits,
+  property updates, deadline management, outline restructuring.
+
+* Grammar Capabilities
+
+The tree-sitter-org grammar parses the following Org constructs into typed
+syntax-tree nodes:
+
+| Node               | Description                                      |
+|--------------------+--------------------------------------------------|
+| ~document~         | Root node; contains ~body~ and ~section~ nodes   |
+| ~section~          | A headed subtree (headline + optional body)      |
+| ~headline~         | Stars, item text, and optional tag list          |
+| ~stars~            | The leading ~*~ characters (encodes depth)       |
+| ~item~             | The text portion of a headline                   |
+| ~tag_list~ / ~tag~ | Tags attached to a headline                      |
+| ~body~             | Content between two headlines                    |
+| ~paragraph~        | One or more ~expr~ nodes forming a text block    |
+| ~directive~        | ~#+KEY: value~ lines                             |
+| ~property_drawer~  | ~:PROPERTIES: ... :END:~ blocks                  |
+| ~property~         | A single ~:name: value~ pair                     |
+| ~plan~             | SCHEDULED / DEADLINE / CLOSED timestamps         |
+| ~timestamp~        | Active ~<...>~ or inactive ~[...]~ timestamps    |
+| ~block~            | ~#+BEGIN_... #+END_...~ blocks (e.g. src, quote) |
+| ~dynamic_block~    | ~#+BEGIN: ... #+END:~ dynamic blocks             |
+| ~drawer~           | Named ~:DRAWER: ... :END:~ blocks                |
+| ~list~             | Ordered or unordered lists                       |
+| ~listitem~         | A single list item with optional checkbox        |
+| ~checkbox~         | ~[ ]~, ~[X]~, or ~[-]~ checkbox                  |
+| ~fndef~            | Footnote definitions ~[fn:LABEL] text~           |
+| ~comment~          | ~# ...~ comment lines                            |
+| ~table~            | Org tables including horizontal rulers           |
+
+* Query Examples
+
+These are illustrative tree-sitter S-expression patterns against the org
+grammar. They serve as a reference for both the predefined query layer and
+for direct use of the native query interface.
+
+** All top-level headlines
+
+#+begin_src scheme
+(section
+  headline: (headline
+    stars: (stars) @stars
+    item: (item) @title))
+#+end_src
+
+** Headlines matching a pattern
+
+Use a ~#match?~ predicate on the ~item~ capture:
+
+#+begin_src scheme
+(section
+  headline: (headline
+    item: (item) @title
+    (#match? @title "experiment")))
+#+end_src
+
+** Headlines with a specific tag
+
+#+begin_src scheme
+(section
+  headline: (headline
+    item: (item) @title
+    tags: (tag_list
+      (tag) @tag
+      (#eq? @tag "notebook"))))
+#+end_src
+
+** All source blocks with their language
+
+#+begin_src scheme
+(block
+  name: (expr) @lang
+  (#eq? @lang "src")
+  contents: (contents) @body)
+#+end_src
+
+** TODO items (keyword in headline item)
+
+#+begin_src scheme
+(headline
+  item: (item
+    . (expr) @kw
+    (#eq? @kw "TODO")) @title)
+#+end_src
+
+** Property values by name
+
+#+begin_src scheme
+(property
+  name: (expr) @name
+  (#eq? @name "CUSTOM_ID")
+  value: (value) @val)
+#+end_src
+
+** Timestamps (active)
+
+#+begin_src scheme
+(timestamp "<"
+  date: (date) @date
+  day: (day) @day) @ts
+#+end_src
+
+* Project Status
+
+The server is under active development.  The grammar audit is the first
+milestone: verifying which constructs parse correctly, which have known
+limitations, and establishing a test corpus that covers realistic Org files.
