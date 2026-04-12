@@ -243,11 +243,12 @@ First expr in item is the keyword (anchored with `.`).
 ```
 
 ## All source blocks (language + body)
-`@lang` is the language token; `@contents` is the block body.
+`@lang` is the language token (anchored with `.` to avoid capturing
+header args like `:tangle`); `@contents` is the block body.
 ```scheme
 (block
   name: (expr) @_kw (#eq? @_kw "src")
-  (expr) @lang
+  . parameter: (expr) @lang
   contents: (contents) @contents)
 ```
 
@@ -255,7 +256,7 @@ First expr in item is the keyword (anchored with `.`).
 ```scheme
 (block
   name: (expr) @_kw (#eq? @_kw "src")
-  (expr) @lang (#eq? @lang "python")
+  . parameter: (expr) @lang (#eq? @lang "python")
   contents: (contents) @contents)
 ```
 
