@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use org_parser::{get_subtree, make_parser, outline, run_query, QueryMatch};
+use org_parser::{get_subtree, make_parser, outline, parse_org_link, run_query, QueryMatch};
 
 // ── parameter types ───────────────────────────────────────────────────────────
 
@@ -42,6 +42,19 @@ struct SearchDirParams {
     dir: String,
     /// Tree-sitter S-expression query string.
     query: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct OpenLinkParams {
+    /// Org-mode link string. Accepted forms (with or without outer [[ ]]):
+    ///   [[#my-id]]                      — CUSTOM_ID in the same file
+    ///   [[file:path/to/file.org::#id]]  — CUSTOM_ID in another file
+    ///   [[file:path/to/file.org::*H/S]] — heading path (/ separates levels)
+    ///   [[file:path/to/file.org]]       — whole file content
+    link: String,
+    /// Absolute path to the file that contains the link. Required for
+    /// same-file links ([[#id]]) and to resolve relative file paths.
+    base_file: Option<String>,
 }
 
 // ── per-file match with path ──────────────────────────────────────────────────
@@ -126,6 +139,22 @@ impl OrgMcpServer {
     async fn query_examples(&self) -> String {
         QUERY_EXAMPLES.to_string()
     }
+
+    /// Follow an Org-mode link and return the full text of the target section
+    /// (or the whole file when no section target is specified).
+    ///
+    /// Supported link forms (with or without outer [[ ]]):
+    ///   [[#my-id]]                       — CUSTOM_ID in base_file
+    ///   [[file:path/to/file.org::#id]]   — CUSTOM_ID in another file
+    ///   [[file:path/to/file.org::*H/S]]  — heading path (/ separates levels)
+    ///   [[file:path/to/file.org]]        — whole file content
+    #[tool(description = "Follow an Org-mode link (CUSTOM_ID, heading path, or file) and return the full content.")]
+    async fn open_link(&self, Parameters(p): Parameters<OpenLinkParams>) -> String {
+        match follow_org_link(&p.link, p.base_file.as_deref()) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
 }
 
 #[tool_handler(
@@ -134,11 +163,14 @@ impl OrgMcpServer {
     instructions = "Structural navigation and querying of Org mode files via tree-sitter. \
 Use `outline` to orient in a document, `query` to run precise S-expression \
 queries, `subtree` to retrieve a section's full text, `search_dir` to find \
-matching nodes across a library of org files, and `query_examples` to discover \
-useful query patterns. All results include breadcrumb paths showing where in \
-the heading hierarchy a match lives. Byte ranges are ephemeral — re-run the \
-query if the file may have changed. For stable cross-call references, use \
-CUSTOM_ID properties in org section drawers."
+matching nodes across a library of org files, `open_link` to follow an \
+Org-mode link (CUSTOM_ID, heading path, or bare file) and retrieve its full \
+content, and `query_examples` to discover useful query patterns. All query \
+results include breadcrumb paths and a context snippet showing the surrounding \
+source lines; the snippet width adapts to match density and proximity to the \
+nearest heading. Byte ranges are ephemeral — re-run the query if the file may \
+have changed. For stable cross-call references, use CUSTOM_ID properties in \
+org section drawers."
 )]
 impl ServerHandler for OrgMcpServer {}
 
@@ -191,6 +223,39 @@ fn collect_org_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::R
         }
     }
     Ok(())
+}
+
+fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String> {
+    let parsed = parse_org_link(link)?;
+
+    let file: String = match &parsed.file {
+        Some(f) => {
+            if Path::new(f).is_absolute() {
+                f.clone()
+            } else {
+                let base = base_file.ok_or_else(|| {
+                    anyhow::anyhow!("base_file required to resolve relative path {f:?}")
+                })?;
+                Path::new(base)
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
+                    .join(f)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        }
+        None => base_file
+            .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))?
+            .to_string(),
+    };
+
+    match (parsed.heading_path.as_deref(), parsed.custom_id.as_deref()) {
+        (None, None) => std::fs::read_to_string(&file)
+            .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}")),
+        _ => parse_and_run(&file, |src, tree| {
+            get_subtree(src, tree, parsed.heading_path.as_deref(), parsed.custom_id.as_deref())
+        }),
+    }
 }
 
 fn error_json(msg: &str) -> String {

@@ -35,6 +35,11 @@ pub struct QueryMatch {
     /// Heading ancestors from document root to immediate parent section,
     /// innermost last. Empty for top-level body nodes.
     pub breadcrumbs: Vec<String>,
+    /// Surrounding source lines for context. Width is chosen by a heuristic:
+    /// fewer total matches → more lines; closer to a heading → fewer lines
+    /// before (the heading already orients the reader).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 /// A heading in the document outline.

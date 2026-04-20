@@ -5,6 +5,55 @@ use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 use crate::types::{ByteRange, HeadlineEntry, Position, QueryMatch};
 
+// ── context helpers ───────────────────────────────────────────────────────────
+
+/// Return 0-indexed line numbers of every heading line (starts with `*`).
+fn header_line_numbers(source: &[u8]) -> Vec<usize> {
+    std::str::from_utf8(source)
+        .unwrap_or("")
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with('*'))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Lines between `match_line` and the nearest preceding heading line.
+/// Returns `usize::MAX` when there is no preceding heading.
+fn dist_from_prev_header(headers: &[usize], match_line: usize) -> usize {
+    let idx = headers.partition_point(|&h| h < match_line);
+    if idx == 0 { usize::MAX } else { match_line - headers[idx - 1] }
+}
+
+/// Heuristic: (lines_before, lines_after) as a function of total match count
+/// and distance from the preceding heading.
+///
+/// Fewer matches → wider window; proximity to heading → tighter window before
+/// (the heading itself already orients the reader).
+fn context_window(total: usize, dist: usize) -> (usize, usize) {
+    let base: usize = match total {
+        0..=5 => 4,
+        6..=15 => 3,
+        16..=35 => 2,
+        36..=80 => 1,
+        _ => 0,
+    };
+    let before = base.min(dist.saturating_sub(1));
+    (before, base)
+}
+
+fn extract_context(lines: &[&str], start: usize, end: usize, before: usize, after: usize) -> Option<String> {
+    if before == 0 && after == 0 {
+        return None;
+    }
+    let from = start.saturating_sub(before);
+    let to = (end + after + 1).min(lines.len());
+    if from >= to {
+        return None;
+    }
+    Some(lines[from..to].join("\n"))
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn position(p: tree_sitter::Point) -> Position {
@@ -131,6 +180,7 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
                 start_position: position(node.start_position()),
                 end_position: position(node.end_position()),
                 breadcrumbs: breadcrumbs(node, source),
+                context: None,
             });
         }
         match_id += 1;
@@ -138,6 +188,20 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
     if cursor.did_exceed_match_limit() {
         eprintln!("warn: query match limit exceeded — results may be incomplete");
     }
+
+    // Attach context lines using the density/proximity heuristic.
+    let src_str = std::str::from_utf8(source).unwrap_or("");
+    let lines: Vec<&str> = src_str.lines().collect();
+    let headers = header_line_numbers(source);
+    let total = results.len();
+    for qm in &mut results {
+        let start = qm.start_position.row;
+        let end = qm.end_position.row;
+        let dist = dist_from_prev_header(&headers, start);
+        let (before, after) = context_window(total, dist);
+        qm.context = extract_context(&lines, start, end, before, after);
+    }
+
     Ok(results)
 }
 
@@ -234,4 +298,55 @@ pub fn get_subtree(
             .to_string()),
         None => bail!("section not found"),
     }
+}
+
+// ── org link parsing ──────────────────────────────────────────────────────────
+
+/// A parsed Org-mode link target.
+pub struct OrgLink {
+    /// Resolved file path. `None` means the link refers to the same file as
+    /// the document containing the link (use `base_file` to resolve it).
+    pub file: Option<String>,
+    /// `::*Heading/Subheading` target split on `/`.
+    pub heading_path: Option<Vec<String>>,
+    /// `::#custom-id` target.
+    pub custom_id: Option<String>,
+}
+
+/// Parse an Org-mode link string into its components.
+///
+/// Accepted formats (with or without the outer `[[` / `]]`):
+/// - `[[#id]]` — CUSTOM_ID in the same file
+/// - `[[file:path.org::#id]]` — CUSTOM_ID in another file
+/// - `[[file:path.org::*Heading/Sub]]` — heading path in another file
+/// - `[[file:path.org]]` — whole file (no section target)
+pub fn parse_org_link(raw: &str) -> Result<OrgLink> {
+    let trimmed = raw.trim();
+    // Strip [[ ]] wrapper and optional description after ][
+    let inner = trimmed
+        .strip_prefix("[[")
+        .and_then(|s| s.strip_suffix("]]"))
+        .map(|s| s.splitn(2, "][").next().unwrap_or(s))
+        .unwrap_or(trimmed);
+
+    if let Some(id) = inner.strip_prefix('#') {
+        return Ok(OrgLink { file: None, custom_id: Some(id.to_string()), heading_path: None });
+    }
+
+    if let Some(rest) = inner.strip_prefix("file:") {
+        return if let Some((path, target)) = rest.split_once("::") {
+            if let Some(id) = target.strip_prefix('#') {
+                Ok(OrgLink { file: Some(path.to_string()), custom_id: Some(id.to_string()), heading_path: None })
+            } else if let Some(heading) = target.strip_prefix('*') {
+                let parts = heading.split('/').map(|s| s.trim().to_string()).collect();
+                Ok(OrgLink { file: Some(path.to_string()), heading_path: Some(parts), custom_id: None })
+            } else {
+                bail!("unsupported link target syntax: {target:?}")
+            }
+        } else {
+            Ok(OrgLink { file: Some(rest.to_string()), custom_id: None, heading_path: None })
+        };
+    }
+
+    bail!("unsupported link format: {raw:?}")
 }
