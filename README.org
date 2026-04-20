@@ -102,6 +102,29 @@ These are illustrative tree-sitter S-expression patterns against the org
 grammar. They serve as a reference for both the predefined query layer and
 for direct use of the native query interface.
 
+** Note on ~expr~ predicates
+
+~expr~ is the grammar's atomic text token — a single whitespace-delimited
+word. Text predicates (~#eq?~, ~#match?~) on ~expr~ only work reliably when
+the node appears inside a structural parent. A bare ~(expr) @e (#eq? @e "X")~
+at the root of a query is split into two internal patterns by the tree-sitter
+query compiler, causing the predicate to be silently ignored and all ~expr~
+nodes to be returned.
+
+The fix is to wrap in a wildcard parent ~(_ ...)~:
+
+#+begin_src scheme
+; BROKEN — predicate ignored, returns every expr in the document
+(expr) @e (#eq? @e "CUSTOM_ID")
+
+; CORRECT — returns only expr nodes equal to "CUSTOM_ID"
+(_ (expr) @e (#eq? @e "CUSTOM_ID"))
+#+end_src
+
+All examples below follow this rule. When ~expr~ is already a named field
+child of a structural node (e.g. ~name: (expr) @n~ inside ~(property ...)~)
+the predicate works without the wildcard.
+
 ** All top-level headlines
 
 #+begin_src scheme
@@ -135,29 +158,44 @@ Use a ~#match?~ predicate on the ~item~ capture:
 
 ** All source blocks with their language
 
+~@lang~ is anchored with ~.~ to avoid capturing header args like ~:tangle~.
+
 #+begin_src scheme
 (block
-  name: (expr) @lang
-  (#eq? @lang "src")
+  name: (expr) @_kw (#match? @_kw "(?i)^src$")
+  . parameter: (expr) @lang
   contents: (contents) @body)
 #+end_src
 
 ** TODO items (keyword in headline item)
 
 #+begin_src scheme
-(headline
-  item: (item
-    . (expr) @kw
-    (#eq? @kw "TODO")) @title)
+(section
+  headline: (headline
+    item: (item
+      . (expr) @kw
+      (#any-of? @kw "TODO" "DONE" "NEXT" "WAITING" "CANCELLED")) @title))
 #+end_src
 
 ** Property values by name
 
+~expr~ here is a field child of ~property~, so no wildcard is needed.
+
 #+begin_src scheme
-(property
-  name: (expr) @name
-  (#eq? @name "CUSTOM_ID")
-  value: (value) @val)
+(property_drawer
+  (property
+    name: (expr) @_n (#eq? @_n "CUSTOM_ID")
+    value: (value) @val))
+#+end_src
+
+** Org-mode file links
+
+Bracket links like ~[[file:path/to/file.org::#id]]~ are tokenised as a single
+~expr~ spanning ~[[file:...][desc~. Use the wildcard parent so the ~#match?~
+predicate is not silently ignored.
+
+#+begin_src scheme
+(_ (expr) @link (#match? @link "^\\[\\[file:"))
 #+end_src
 
 ** Timestamps (active)
