@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use org_parser::{
-    ensure_custom_id as org_ensure_custom_id, get_subtree, make_parser, outline, parse_org_link,
+    ensure_custom_id as org_ensure_custom_id, make_parser, outline, parse_org_link,
     patch_subtree as org_patch_subtree, run_query, section_for as org_section_for,
-    EnsureCustomIdResult, OrgLink, QueryMatch,
+    EnsureCustomIdResult, OrgLink, QueryMatch, SectionInfo,
 };
 
 // ── parameter types ───────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ struct QueryParams {
     /// Tree-sitter S-expression query string.
     query: String,
     /// Optional regex patterns applied to matched text after structural
-    /// filtering. A result is kept if its text matches at least one pattern.
+    /// filtering. A result is kept only if its text matches all patterns (AND).
     /// When multiple structural nodes cover the same regex hit, only the node
     /// with the smallest byte range (most specific) is returned.
     patterns: Option<Vec<String>>,
@@ -82,8 +82,10 @@ struct OpenLinkParams {
     ///   [[file:path/to/file.org::*H/S]] — heading path (/ separates levels)
     ///   [[file:path/to/file.org]]       — whole file content
     link: String,
-    /// Absolute path to the file that contains the link. Required for
-    /// same-file links ([[#id]]) and to resolve relative file paths.
+    /// File or directory used to resolve same-file and relative links.
+    /// Required for same-file links ([[#id]]); required for relative file
+    /// paths. A file path is accepted (its parent directory is used) as well
+    /// as a bare directory path.
     base_file: Option<String>,
 }
 
@@ -94,6 +96,22 @@ struct FileMatch {
     file: String,
     #[serde(flatten)]
     m: QueryMatch,
+}
+
+/// Result of following a section-targeted org link: SectionInfo fields plus
+/// the resolved absolute file path.
+#[derive(Debug, Serialize)]
+struct LinkedSection {
+    file: String,
+    #[serde(flatten)]
+    info: SectionInfo,
+}
+
+/// Result of following a bare file link (no section target).
+#[derive(Debug, Serialize)]
+struct LinkedFile {
+    file: String,
+    content: String,
 }
 
 // ── server ────────────────────────────────────────────────────────────────────
@@ -121,8 +139,8 @@ impl OrgMcpServer {
     /// directory. Returns a JSON array of matches, each annotated with the
     /// source file path, capture name, text, byte range, source position, and
     /// breadcrumb path through parent headlines. Optionally supply `patterns`
-    /// to further filter results to nodes whose text matches at least one
-    /// regex; when multiple structural nodes cover the same hit the most
+    /// to further filter results to nodes whose text matches all patterns
+    /// (AND); when multiple structural nodes cover the same hit the most
     /// specific (smallest byte range) is kept.
     ///
     /// Use the `query_examples` tool to see documented patterns for the org
@@ -182,15 +200,16 @@ impl OrgMcpServer {
         QUERY_EXAMPLES.to_string()
     }
 
-    /// Follow an Org-mode link and return the full text of the target section
-    /// (or the whole file when no section target is specified).
+    /// Follow an Org-mode link and return structured section metadata (same
+    /// shape as `subtree`) for section-targeted links, or `{file, content}`
+    /// for bare file links. The resolved absolute file path is always included.
     ///
     /// Supported link forms (with or without outer [[ ]]):
     ///   [[#my-id]]                       — CUSTOM_ID in base_file
     ///   [[file:path/to/file.org::#id]]   — CUSTOM_ID in another file
     ///   [[file:path/to/file.org::*H/S]]  — heading path (/ separates levels)
-    ///   [[file:path/to/file.org]]        — whole file content
-    #[tool(description = "Follow an Org-mode link (CUSTOM_ID, heading path, or file) and return the full content.")]
+    ///   [[file:path/to/file.org]]        — whole file, returns {file, content}
+    #[tool(description = "Follow an Org-mode link and return structured section metadata (title, depth, custom_id, breadcrumbs, subtree text, resolved file path), or {file, content} for bare file links.")]
     async fn open_link(&self, Parameters(p): Parameters<OpenLinkParams>) -> String {
         match follow_org_link(&p.link, p.base_file.as_deref()) {
             Ok(s) => s,
@@ -229,12 +248,14 @@ impl OrgMcpServer {
     instructions = "Structural navigation and querying of Org mode files via tree-sitter. \
 Use `outline` to orient in a document, `query` to run precise S-expression \
 queries against a single file or an entire directory of org files, `subtree` \
-to retrieve a section's full text, `open_link` to follow an Org-mode link \
-(CUSTOM_ID, heading path, or bare file) and retrieve its full content, and \
+to retrieve a section's full metadata and text, `open_link` to follow an \
+Org-mode link (CUSTOM_ID, heading path, or bare file) and retrieve structured \
+section metadata (same shape as `subtree`, with resolved file path) or \
+{file, content} for bare file links, and \
 `query_examples` to discover useful query patterns. `query` accepts an \
-optional `patterns` list to filter results by regex after structural matching; \
-when the same text span is covered by multiple nodes the most specific one is \
-kept. All query results include the source file path, breadcrumb paths, and a \
+optional `patterns` list to filter results by regex after structural matching \
+(all patterns must match — AND semantics); when the same text span is covered \
+by multiple nodes the most specific one is kept. All query results include the source file path, breadcrumb paths, and a \
 context snippet; the snippet width adapts to match density and proximity to \
 the nearest heading. Byte ranges are ephemeral — re-run the query if the file \
 may have changed. For stable cross-call references, use CUSTOM_ID properties \
@@ -315,36 +336,45 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String
         let base = base_file.ok_or_else(|| {
             anyhow::anyhow!("base_file required to resolve relative path {f:?}")
         })?;
-        Ok(Path::new(base)
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
-            .join(f)
-            .to_string_lossy()
-            .into_owned())
+        let base_path = Path::new(base);
+        let base_dir = if base_path.is_dir() {
+            base_path
+        } else {
+            base_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
+        };
+        Ok(base_dir.join(f).to_string_lossy().into_owned())
     };
     let require_base = || {
         base_file
             .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))
             .map(str::to_string)
     };
+    let section_json = |file: String, heading_path: Option<Vec<String>>, custom_id: Option<String>| -> anyhow::Result<String> {
+        let file_for_result = file.clone();
+        parse_and_run(&file, move |src, tree| {
+            let info = org_section_for(src, tree, heading_path.as_deref(), custom_id.as_deref(), None)?
+                .ok_or_else(|| anyhow::anyhow!("section not found"))?;
+            Ok(serde_json::to_string_pretty(&LinkedSection { file: file_for_result, info })?)
+        })
+    };
 
     match parse_org_link(link)? {
         OrgLink::SameFileId(id) => {
-            let file = require_base()?;
-            parse_and_run(&file, |src, tree| get_subtree(src, tree, None, Some(&id)))
+            section_json(require_base()?, None, Some(id))
         }
         OrgLink::File(f) => {
             let file = resolve(&f)?;
-            std::fs::read_to_string(&file)
-                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+            Ok(serde_json::to_string_pretty(&LinkedFile { file, content })?)
         }
         OrgLink::FileId { file: f, id } => {
-            let file = resolve(&f)?;
-            parse_and_run(&file, |src, tree| get_subtree(src, tree, None, Some(&id)))
+            section_json(resolve(&f)?, None, Some(id))
         }
         OrgLink::FilePath { file: f, path } => {
-            let file = resolve(&f)?;
-            parse_and_run(&file, |src, tree| get_subtree(src, tree, Some(&path), None))
+            section_json(resolve(&f)?, Some(path), None)
         }
     }
 }

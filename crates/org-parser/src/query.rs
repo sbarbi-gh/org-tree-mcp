@@ -177,43 +177,50 @@ pub fn outline(source: &[u8], tree: &Tree) -> Result<Vec<HeadlineEntry>> {
 
 // ── run_query ─────────────────────────────────────────────────────────────────
 
-/// Keep only results whose text matches at least one pattern, preferring the
+/// Keep only results whose text matches all patterns (AND), preferring the
 /// structurally narrowest node (smallest byte range) for each regex hit span.
 fn filter_by_patterns(results: Vec<QueryMatch>, patterns: &[Regex]) -> Vec<QueryMatch> {
     if patterns.is_empty() {
         return results;
     }
 
-    // Absolute byte spans of every regex hit within each result's text.
-    let result_spans: Vec<Vec<(usize, usize)>> = results
+    // For each result, collect all hit spans only if every pattern matches at least once.
+    let result_spans: Vec<Option<Vec<(usize, usize)>>> = results
         .iter()
         .map(|qm| {
             let base = qm.range.start;
-            patterns
-                .iter()
-                .flat_map(|pat| {
-                    pat.find_iter(&qm.text)
-                        .map(move |m| (base + m.start(), base + m.end()))
-                })
-                .collect()
+            let mut all_spans = Vec::new();
+            for pat in patterns {
+                let spans: Vec<_> = pat
+                    .find_iter(&qm.text)
+                    .map(|m| (base + m.start(), base + m.end()))
+                    .collect();
+                if spans.is_empty() {
+                    return None; // pattern not found — AND fails
+                }
+                all_spans.extend(spans);
+            }
+            Some(all_spans)
         })
         .collect();
 
     // For each hit span, elect the result with the smallest enclosing byte range.
     let mut span_winner: std::collections::HashMap<(usize, usize), usize> =
         std::collections::HashMap::new();
-    for (i, spans) in result_spans.iter().enumerate() {
-        let size = results[i].range.end - results[i].range.start;
-        for &span in spans {
-            span_winner
-                .entry(span)
-                .and_modify(|w| {
-                    let w_size = results[*w].range.end - results[*w].range.start;
-                    if size < w_size {
-                        *w = i;
-                    }
-                })
-                .or_insert(i);
+    for (i, spans_opt) in result_spans.iter().enumerate() {
+        if let Some(spans) = spans_opt {
+            let size = results[i].range.end - results[i].range.start;
+            for &span in spans {
+                span_winner
+                    .entry(span)
+                    .and_modify(|w| {
+                        let w_size = results[*w].range.end - results[*w].range.start;
+                        if size < w_size {
+                            *w = i;
+                        }
+                    })
+                    .or_insert(i);
+            }
         }
     }
 
@@ -228,7 +235,7 @@ fn filter_by_patterns(results: Vec<QueryMatch>, patterns: &[Regex]) -> Vec<Query
 
 /// Execute an arbitrary tree-sitter S-expression query.
 /// Returns one [`QueryMatch`] per capture per pattern match, optionally
-/// filtered to results whose text matches at least one of `patterns`.
+/// filtered to results whose text matches all of `patterns` (AND).
 pub fn run_query(source: &[u8], tree: &Tree, query_src: &str, patterns: &[Regex]) -> Result<Vec<QueryMatch>> {
     let (query, mut cursor) = make_cursor(query_src)?;
     let mut results = Vec::new();
