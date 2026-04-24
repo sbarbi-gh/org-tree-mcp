@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use org_parser::{get_subtree, make_parser, outline, parse_org_link, run_query, QueryMatch};
+use org_parser::{get_subtree, make_parser, outline, parse_org_link, run_query, OrgLink, QueryMatch};
 
 // ── parameter types ───────────────────────────────────────────────────────────
 
@@ -226,35 +226,44 @@ fn collect_org_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::R
 }
 
 fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String> {
-    let parsed = parse_org_link(link)?;
-
-    let file: String = match &parsed.file {
-        Some(f) => {
-            if Path::new(f).is_absolute() {
-                f.clone()
-            } else {
-                let base = base_file.ok_or_else(|| {
-                    anyhow::anyhow!("base_file required to resolve relative path {f:?}")
-                })?;
-                Path::new(base)
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
-                    .join(f)
-                    .to_string_lossy()
-                    .into_owned()
-            }
+    let resolve = |f: &str| -> anyhow::Result<String> {
+        if Path::new(f).is_absolute() {
+            return Ok(f.to_string());
         }
-        None => base_file
-            .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))?
-            .to_string(),
+        let base = base_file.ok_or_else(|| {
+            anyhow::anyhow!("base_file required to resolve relative path {f:?}")
+        })?;
+        Ok(Path::new(base)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
+            .join(f)
+            .to_string_lossy()
+            .into_owned())
+    };
+    let require_base = || {
+        base_file
+            .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))
+            .map(str::to_string)
     };
 
-    match (parsed.heading_path.as_deref(), parsed.custom_id.as_deref()) {
-        (None, None) => std::fs::read_to_string(&file)
-            .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}")),
-        _ => parse_and_run(&file, |src, tree| {
-            get_subtree(src, tree, parsed.heading_path.as_deref(), parsed.custom_id.as_deref())
-        }),
+    match parse_org_link(link)? {
+        OrgLink::SameFileId(id) => {
+            let file = require_base()?;
+            parse_and_run(&file, |src, tree| get_subtree(src, tree, None, Some(&id)))
+        }
+        OrgLink::File(f) => {
+            let file = resolve(&f)?;
+            std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))
+        }
+        OrgLink::FileId { file: f, id } => {
+            let file = resolve(&f)?;
+            parse_and_run(&file, |src, tree| get_subtree(src, tree, None, Some(&id)))
+        }
+        OrgLink::FilePath { file: f, path } => {
+            let file = resolve(&f)?;
+            parse_and_run(&file, |src, tree| get_subtree(src, tree, Some(&path), None))
+        }
     }
 }
 

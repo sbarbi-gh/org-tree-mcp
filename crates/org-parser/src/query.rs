@@ -7,7 +7,6 @@ use crate::types::{ByteRange, HeadlineEntry, Position, QueryMatch};
 
 // ── context helpers ───────────────────────────────────────────────────────────
 
-/// Return 0-indexed line numbers of every heading line (starts with `*`).
 fn header_line_numbers(source: &[u8]) -> Vec<usize> {
     std::str::from_utf8(source)
         .unwrap_or("")
@@ -18,18 +17,11 @@ fn header_line_numbers(source: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// Lines between `match_line` and the nearest preceding heading line.
-/// Returns `usize::MAX` when there is no preceding heading.
 fn dist_from_prev_header(headers: &[usize], match_line: usize) -> usize {
     let idx = headers.partition_point(|&h| h < match_line);
     if idx == 0 { usize::MAX } else { match_line - headers[idx - 1] }
 }
 
-/// Heuristic: (lines_before, lines_after) as a function of total match count
-/// and distance from the preceding heading.
-///
-/// Fewer matches → wider window; proximity to heading → tighter window before
-/// (the heading itself already orients the reader).
 fn context_window(total: usize, dist: usize) -> (usize, usize) {
     let base: usize = match total {
         0..=5 => 4,
@@ -54,7 +46,7 @@ fn extract_context(lines: &[&str], start: usize, end: usize, before: usize, afte
     Some(lines[from..to].join("\n"))
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── node helpers ──────────────────────────────────────────────────────────────
 
 fn position(p: tree_sitter::Point) -> Position {
     Position { row: p.row, column: p.column }
@@ -64,7 +56,6 @@ fn byte_range(n: &Node) -> ByteRange {
     ByteRange { start: n.start_byte(), end: n.end_byte() }
 }
 
-/// Collect all `section` → `headline` ancestors of `node`, innermost last.
 fn breadcrumbs(node: Node, source: &[u8]) -> Vec<String> {
     let mut crumbs = Vec::new();
     let mut cur = node.parent();
@@ -84,7 +75,6 @@ fn breadcrumbs(node: Node, source: &[u8]) -> Vec<String> {
     crumbs
 }
 
-/// Split "TODO My headline" → (Some("TODO"), "My headline").
 fn split_keyword(title: &str) -> (Option<String>, String) {
     const KW: &[&str] = &["TODO", "DONE", "NEXT", "WAITING", "CANCELLED"];
     if let Some((first, rest)) = title.split_once(' ') {
@@ -95,7 +85,7 @@ fn split_keyword(title: &str) -> (Option<String>, String) {
     (None, title.to_string())
 }
 
-fn tags_from_headline<'a>(headline: Node<'a>, source: &[u8]) -> Vec<String> {
+fn tags_from_headline(headline: Node, source: &[u8]) -> Vec<String> {
     let Some(tag_list) = headline.child_by_field_name("tags") else {
         return Vec::new();
     };
@@ -108,42 +98,81 @@ fn tags_from_headline<'a>(headline: Node<'a>, source: &[u8]) -> Vec<String> {
         .collect()
 }
 
-// ── outline ───────────────────────────────────────────────────────────────────
-
-/// Recursively collect all headlines via direct AST traversal.
-fn collect_headlines(node: Node, source: &[u8], entries: &mut Vec<HeadlineEntry>) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "section" {
-            if let Some(headline) = child.child_by_field_name("headline") {
-                let stars = headline
-                    .child_by_field_name("stars")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let item = headline.child_by_field_name("item");
-                if let Some(item_node) = item {
-                    let full = item_node.utf8_text(source).unwrap_or("").trim().to_string();
-                    let (keyword, title) = split_keyword(&full);
-                    entries.push(HeadlineEntry {
-                        depth: stars.len(),
-                        title,
-                        todo_keyword: keyword,
-                        tags: tags_from_headline(headline, source),
-                        range: byte_range(&child),
-                        start_position: position(headline.start_position()),
-                    });
-                }
-            }
-            collect_headlines(child, source, entries);
+fn section_custom_id(section: Node, source: &[u8]) -> Option<String> {
+    let pd = section.child_by_field_name("property_drawer")?;
+    let mut c = pd.walk();
+    for prop in pd.children(&mut c) {
+        if prop.kind() != "property" {
+            continue;
+        }
+        let name = prop.child_by_field_name("name")?.utf8_text(source).ok()?;
+        if name.eq_ignore_ascii_case("CUSTOM_ID") {
+            let val = prop.child_by_field_name("value")?.utf8_text(source).ok()?;
+            return Some(val.trim().to_string());
         }
     }
+    None
 }
 
-/// Return a flat ordered list of all headlines in the document.
+// ── query engine ──────────────────────────────────────────────────────────────
+
+fn make_cursor(scm: &str) -> Result<(Query, QueryCursor)> {
+    let language = tree_sitter_org::language();
+    let query = Query::new(&language, scm).context("failed to compile query")?;
+    let mut cursor = QueryCursor::new();
+    cursor.set_match_limit(u32::MAX);
+    Ok((query, cursor))
+}
+
+/// Execute `scm` rooted at `node`, invoking `f` with the first non-internal
+/// capture of each match. Return `None` from `f` to skip a match.
+fn query_nodes<'tree, T>(
+    source: &[u8],
+    node: Node<'tree>,
+    scm: &str,
+    mut f: impl FnMut(Node<'tree>, &[u8]) -> Option<T>,
+) -> Result<Vec<T>> {
+    let (query, mut cursor) = make_cursor(scm)?;
+    let mut results = Vec::new();
+    let mut matches = cursor.matches(&query, node, source);
+    while let Some(qmatch) = matches.next() {
+        for capture in qmatch.captures {
+            let name = query.capture_names()[capture.index as usize];
+            if !name.starts_with('_') {
+                if let Some(val) = f(capture.node, source) {
+                    results.push(val);
+                }
+                break;
+            }
+        }
+    }
+    if cursor.did_exceed_match_limit() {
+        eprintln!("warn: query match limit exceeded — results may be incomplete");
+    }
+    Ok(results)
+}
+
+// ── outline ───────────────────────────────────────────────────────────────────
+
 pub fn outline(source: &[u8], tree: &Tree) -> Result<Vec<HeadlineEntry>> {
-    let mut entries = Vec::new();
-    collect_headlines(tree.root_node(), source, &mut entries);
-    Ok(entries)
+    query_nodes(source, tree.root_node(), "(section) @section", |n, src| {
+        let headline = n.child_by_field_name("headline")?;
+        let stars = headline
+            .child_by_field_name("stars")
+            .and_then(|s| s.utf8_text(src).ok())
+            .unwrap_or("");
+        let item = headline.child_by_field_name("item")?;
+        let full = item.utf8_text(src).ok()?.trim().to_string();
+        let (keyword, title) = split_keyword(&full);
+        Some(HeadlineEntry {
+            depth: stars.len(),
+            title,
+            todo_keyword: keyword,
+            tags: tags_from_headline(headline, src),
+            range: byte_range(&n),
+            start_position: position(headline.start_position()),
+        })
+    })
 }
 
 // ── run_query ─────────────────────────────────────────────────────────────────
@@ -151,15 +180,7 @@ pub fn outline(source: &[u8], tree: &Tree) -> Result<Vec<HeadlineEntry>> {
 /// Execute an arbitrary tree-sitter S-expression query.
 /// Returns one [`QueryMatch`] per capture per pattern match.
 pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<QueryMatch>> {
-    let language = tree_sitter_org::language();
-    let query = Query::new(&language, query_src).context("failed to compile query")?;
-    let mut cursor = QueryCursor::new();
-    // Remove the default in-progress-match cap. When a pattern has multiple
-    // predicates on different captures (e.g. #eq? @lang + #match? @contents),
-    // tree-sitter tracks many partial matches simultaneously and silently drops
-    // results once the limit is hit. u32::MAX disables the cap.
-    cursor.set_match_limit(u32::MAX);
-
+    let (query, mut cursor) = make_cursor(query_src)?;
     let mut results = Vec::new();
     let mut match_id = 0usize;
     let mut matches = cursor.matches(&query, tree.root_node(), source);
@@ -167,7 +188,6 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
         for capture in qmatch.captures {
             let node = capture.node;
             let name = query.capture_names()[capture.index as usize].to_string();
-            // Skip internal captures (prefixed with _) from results
             if name.starts_with('_') {
                 continue;
             }
@@ -189,7 +209,6 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
         eprintln!("warn: query match limit exceeded — results may be incomplete");
     }
 
-    // Attach context lines using the density/proximity heuristic.
     let src_str = std::str::from_utf8(source).unwrap_or("");
     let lines: Vec<&str> = src_str.lines().collect();
     let headers = header_line_numbers(source);
@@ -207,80 +226,51 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
 
 // ── get_subtree ───────────────────────────────────────────────────────────────
 
-/// Find a section node by walking a heading-title path.
-/// Each element of `path` is compiled as a case-insensitive regex and matched
-/// against the cleaned headline title (TODO keyword stripped).
-fn find_section_by_path<'a>(
-    root: Node<'a>,
+fn find_section_by_path<'tree>(
     source: &[u8],
+    root: Node<'tree>,
     path: &[String],
-) -> Result<Option<Node<'a>>> {
+) -> Result<Option<Node<'tree>>> {
     if path.is_empty() {
         return Ok(None);
     }
     let pat = Regex::new(&format!("(?i){}", path[0]))
         .with_context(|| format!("invalid heading regex: {:?}", path[0]))?;
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() != "section" {
-            continue;
+    let root_id = root.id();
+    let found = query_nodes(source, root, "(section) @section", |n, src| {
+        if n.parent().map(|p| p.id()) != Some(root_id) {
+            return None;
         }
-        let title = child
+        let title = n
             .child_by_field_name("headline")
             .and_then(|h| h.child_by_field_name("item"))
-            .and_then(|i| i.utf8_text(source).ok())
+            .and_then(|i| i.utf8_text(src).ok())
             .map(|t| split_keyword(t.trim()).1)
             .unwrap_or_default();
-
-        if pat.is_match(&title) {
-            if path.len() == 1 {
-                return Ok(Some(child));
-            } else {
-                return find_section_by_path(child, source, &path[1..]);
-            }
-        }
+        if pat.is_match(&title) { Some(n) } else { None }
+    })?;
+    match found.into_iter().next() {
+        None => Ok(None),
+        Some(child) if path.len() == 1 => Ok(Some(child)),
+        Some(child) => find_section_by_path(source, child, &path[1..]),
     }
-    Ok(None)
 }
 
-/// Find the first section whose `:CUSTOM_ID:` property matches `id`.
-fn find_section_by_custom_id<'a>(root: Node<'a>, source: &[u8], id: &str) -> Option<Node<'a>> {
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() != "section" {
-            continue;
-        }
-        // check property_drawer for CUSTOM_ID
-        if let Some(prop_drawer) = child.child_by_field_name("property_drawer") {
-            let mut pc = prop_drawer.walk();
-            for prop in prop_drawer.children(&mut pc) {
-                if prop.kind() != "property" {
-                    continue;
-                }
-                let name = prop
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                let value = prop
-                    .child_by_field_name("value")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .unwrap_or("");
-                if name.eq_ignore_ascii_case("CUSTOM_ID") && value.trim() == id {
-                    return Some(child);
-                }
-            }
-        }
-        // recurse into subsections
-        if let Some(found) = find_section_by_custom_id(child, source, id) {
-            return Some(found);
-        }
-    }
-    None
+fn find_section_by_custom_id<'tree>(
+    source: &[u8],
+    root: Node<'tree>,
+    id: &str,
+) -> Result<Option<Node<'tree>>> {
+    Ok(query_nodes(
+        source, root,
+        r#"(section (property_drawer (property
+            name: (expr) @_name (#match? @_name "(?i)^CUSTOM_ID$")))) @section"#,
+        |n, src| {
+            section_custom_id(n, src).filter(|v| v == id).map(|_| n)
+        },
+    )?.into_iter().next())
 }
 
-/// Return the raw org text of a subtree identified by a heading path or CUSTOM_ID.
-///
-/// Exactly one of `heading_path` or `custom_id` must be `Some`.
 pub fn get_subtree(
     source: &[u8],
     tree: &Tree,
@@ -288,8 +278,8 @@ pub fn get_subtree(
     custom_id: Option<&str>,
 ) -> Result<String> {
     let node = match (heading_path, custom_id) {
-        (Some(path), None) => find_section_by_path(tree.root_node(), source, path)?,
-        (None, Some(id)) => find_section_by_custom_id(tree.root_node(), source, id),
+        (Some(path), None) => find_section_by_path(source, tree.root_node(), path)?,
+        (None, Some(id)) => find_section_by_custom_id(source, tree.root_node(), id)?,
         _ => bail!("provide exactly one of heading_path or custom_id"),
     };
     match node {
@@ -302,27 +292,19 @@ pub fn get_subtree(
 
 // ── org link parsing ──────────────────────────────────────────────────────────
 
-/// A parsed Org-mode link target.
-pub struct OrgLink {
-    /// Resolved file path. `None` means the link refers to the same file as
-    /// the document containing the link (use `base_file` to resolve it).
-    pub file: Option<String>,
-    /// `::*Heading/Subheading` target split on `/`.
-    pub heading_path: Option<Vec<String>>,
-    /// `::#custom-id` target.
-    pub custom_id: Option<String>,
+pub enum OrgLink {
+    /// `[[#id]]` — CUSTOM_ID in the same file
+    SameFileId(String),
+    /// `[[file:path.org]]` — whole file, no section target
+    File(String),
+    /// `[[file:path.org::#id]]`
+    FileId { file: String, id: String },
+    /// `[[file:path.org::*Heading/Sub]]`
+    FilePath { file: String, path: Vec<String> },
 }
 
-/// Parse an Org-mode link string into its components.
-///
-/// Accepted formats (with or without the outer `[[` / `]]`):
-/// - `[[#id]]` — CUSTOM_ID in the same file
-/// - `[[file:path.org::#id]]` — CUSTOM_ID in another file
-/// - `[[file:path.org::*Heading/Sub]]` — heading path in another file
-/// - `[[file:path.org]]` — whole file (no section target)
 pub fn parse_org_link(raw: &str) -> Result<OrgLink> {
     let trimmed = raw.trim();
-    // Strip [[ ]] wrapper and optional description after ][
     let inner = trimmed
         .strip_prefix("[[")
         .and_then(|s| s.strip_suffix("]]"))
@@ -330,21 +312,21 @@ pub fn parse_org_link(raw: &str) -> Result<OrgLink> {
         .unwrap_or(trimmed);
 
     if let Some(id) = inner.strip_prefix('#') {
-        return Ok(OrgLink { file: None, custom_id: Some(id.to_string()), heading_path: None });
+        return Ok(OrgLink::SameFileId(id.to_string()));
     }
 
     if let Some(rest) = inner.strip_prefix("file:") {
         return if let Some((path, target)) = rest.split_once("::") {
             if let Some(id) = target.strip_prefix('#') {
-                Ok(OrgLink { file: Some(path.to_string()), custom_id: Some(id.to_string()), heading_path: None })
+                Ok(OrgLink::FileId { file: path.to_string(), id: id.to_string() })
             } else if let Some(heading) = target.strip_prefix('*') {
                 let parts = heading.split('/').map(|s| s.trim().to_string()).collect();
-                Ok(OrgLink { file: Some(path.to_string()), heading_path: Some(parts), custom_id: None })
+                Ok(OrgLink::FilePath { file: path.to_string(), path: parts })
             } else {
                 bail!("unsupported link target syntax: {target:?}")
             }
         } else {
-            Ok(OrgLink { file: Some(rest.to_string()), custom_id: None, heading_path: None })
+            Ok(OrgLink::File(rest.to_string()))
         };
     }
 
