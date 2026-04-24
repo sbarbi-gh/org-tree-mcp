@@ -42,6 +42,26 @@ pub struct QueryMatch {
     pub context: Option<String>,
 }
 
+/// A section resolved by line number, as returned by `section_for`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionInfo {
+    pub title: String,
+    pub depth: usize,
+    pub todo_keyword: Option<String>,
+    /// Existing :CUSTOM_ID: value, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+    /// Ancestor headings from document root, innermost last. Does not include
+    /// this section's own title.
+    pub breadcrumbs: Vec<String>,
+    /// 0-indexed row of the headline.
+    pub start_line: usize,
+    /// Byte range of the section within the file. Ephemeral — re-parse to re-anchor.
+    pub range: ByteRange,
+    /// Full org text of the section (headline + contents + subsections).
+    pub subtree: String,
+}
+
 /// A heading in the document outline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadlineEntry {
