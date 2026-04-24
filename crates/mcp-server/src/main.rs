@@ -6,7 +6,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use org_parser::{get_subtree, make_parser, outline, parse_org_link, run_query, OrgLink, QueryMatch};
+use org_parser::{
+    ensure_custom_id as org_ensure_custom_id, get_subtree, make_parser, outline, parse_org_link,
+    patch_subtree as org_patch_subtree, run_query, section_for as org_section_for,
+    EnsureCustomIdResult, OrgLink, QueryMatch,
+};
 
 // ── parameter types ───────────────────────────────────────────────────────────
 
@@ -40,6 +44,39 @@ struct SubtreeParams {
     /// Value of the :CUSTOM_ID: property of the target section.
     /// Use this OR heading_path.
     custom_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct PatchSubtreeParams {
+    /// Absolute path to the org file.
+    file: String,
+    /// Value of the :CUSTOM_ID: property identifying the target section.
+    custom_id: String,
+    /// Literal string to search for within the section (all occurrences are replaced).
+    search: String,
+    /// Replacement string.
+    replace: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct SectionForParams {
+    /// Absolute path to the org file.
+    file: String,
+    /// 0-indexed row (start_position.row from outline / query results).
+    line: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct EnsureCustomIdParams {
+    /// Absolute path to the org file.
+    file: String,
+    /// 0-indexed row identifying the target section (start_position.row as
+    /// reported by outline / query). Any row that falls inside the section —
+    /// including its headline row — resolves to the innermost enclosing section.
+    line: usize,
+    /// Proposed :CUSTOM_ID: value. A numeric suffix (-2, -3, …) is appended
+    /// automatically if the ID already exists elsewhere in the file.
+    custom_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -160,6 +197,46 @@ impl OrgMcpServer {
             Err(e) => error_json(&e.to_string()),
         }
     }
+
+    /// Apply a literal search-and-replace within the subtree identified by
+    /// `custom_id`. All occurrences of `search` are replaced with `replace`.
+    /// The file is updated in-place. Returns the modified subtree text.
+    #[tool(description = "Search and replace text within the subtree identified by a CUSTOM_ID, writing the result back to the file.")]
+    async fn patch_subtree(&self, Parameters(p): Parameters<PatchSubtreeParams>) -> String {
+        match run_patch(&p.file, &p.custom_id, &p.search, &p.replace) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
+
+    /// Resolve the innermost org section that spans `line` (0-indexed row, as
+    /// reported by `outline` / `query` `start_position.row`). Returns section
+    /// metadata: title, depth, TODO keyword, existing CUSTOM_ID (if any),
+    /// breadcrumb ancestors, and the full subtree text. Useful for turning any
+    /// query match into its enclosing section without needing a CUSTOM_ID.
+    #[tool(description = "Return metadata and subtree text for the section that contains the given 0-indexed line (start_position.row from outline/query results).")]
+    async fn section_for(&self, Parameters(p): Parameters<SectionForParams>) -> String {
+        match parse_and_run(&p.file, |src, tree| {
+            let info = org_section_for(src, tree, p.line)?;
+            Ok(serde_json::to_string_pretty(&info)?)
+        }) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
+
+    /// Ensure the section containing `line` (0-indexed row) has a `:CUSTOM_ID:`
+    /// property. If one already exists it is returned unchanged. Otherwise
+    /// `custom_id` is checked for uniqueness across the file; a `-2`, `-3`, …
+    /// suffix is appended if needed. The file is updated in-place when a new ID
+    /// is inserted. Returns JSON with `custom_id`, `already_existed`, `subtree`.
+    #[tool(description = "Ensure the section at the given 0-indexed line has a :CUSTOM_ID:, inserting one (with automatic disambiguation) if absent.")]
+    async fn ensure_custom_id(&self, Parameters(p): Parameters<EnsureCustomIdParams>) -> String {
+        match run_ensure_custom_id(&p.file, p.line, &p.custom_id) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
 }
 
 #[tool_handler(
@@ -177,7 +254,13 @@ kept. All query results include the source file path, breadcrumb paths, and a \
 context snippet; the snippet width adapts to match density and proximity to \
 the nearest heading. Byte ranges are ephemeral — re-run the query if the file \
 may have changed. For stable cross-call references, use CUSTOM_ID properties \
-in org section drawers."
+in org section drawers. Use `patch_subtree` to apply a literal \
+search-and-replace within a section identified by CUSTOM_ID, writing the \
+result back to the file. Use `section_for` to resolve any 0-indexed line \
+(start_position.row from outline/query results) to its enclosing section \
+metadata and subtree text — useful before assigning a CUSTOM_ID. Use \
+`ensure_custom_id` to add a :CUSTOM_ID: to a section identified by \
+0-indexed line, with automatic disambiguation if the proposed ID is taken."
 )]
 impl ServerHandler for OrgMcpServer {}
 
@@ -279,6 +362,39 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String
             parse_and_run(&file, |src, tree| get_subtree(src, tree, Some(&path), None))
         }
     }
+}
+
+fn run_patch(file: &str, custom_id: &str, search: &str, replace: &str) -> anyhow::Result<String> {
+    let source = std::fs::read(file)
+        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+    let mut parser = make_parser()?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
+    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, custom_id, search, replace)?;
+    std::fs::write(file, &modified_bytes)
+        .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
+    Ok(new_section)
+}
+
+fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::Result<String> {
+    let source = std::fs::read(file)
+        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+    let mut parser = make_parser()?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
+    let EnsureCustomIdResult { custom_id, subtree, file_content, already_existed } =
+        org_ensure_custom_id(&source, &tree, line, proposed_id)?;
+    if !already_existed {
+        std::fs::write(file, &file_content)
+            .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "custom_id": custom_id,
+        "already_existed": already_existed,
+        "subtree": subtree,
+    }))?)
 }
 
 fn error_json(msg: &str) -> String {

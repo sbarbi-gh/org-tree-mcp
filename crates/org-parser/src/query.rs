@@ -3,7 +3,7 @@ use regex::Regex;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
 
-use crate::types::{ByteRange, HeadlineEntry, Position, QueryMatch};
+use crate::types::{ByteRange, HeadlineEntry, Position, QueryMatch, SectionInfo};
 
 // ── context helpers ───────────────────────────────────────────────────────────
 
@@ -343,6 +343,216 @@ pub fn get_subtree(
     }
 }
 
+// ── patch_subtree ─────────────────────────────────────────────────────────────
+
+/// Apply a literal search-and-replace within the subtree identified by
+/// `custom_id`. Returns `(modified_file_bytes, new_section_text)`.
+pub fn patch_subtree(
+    source: &[u8],
+    tree: &Tree,
+    custom_id: &str,
+    search: &str,
+    replace: &str,
+) -> Result<(Vec<u8>, String)> {
+    let section = find_section_by_custom_id(source, tree.root_node(), custom_id)?
+        .ok_or_else(|| anyhow::anyhow!("section with CUSTOM_ID {:?} not found", custom_id))?;
+
+    let section_text = std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
+        .context("section text is not valid UTF-8")?;
+
+    if !section_text.contains(search) {
+        bail!("search string not found in section {:?}", custom_id);
+    }
+
+    let new_section = section_text.replace(search, replace);
+    let mut modified = Vec::with_capacity(
+        source.len() + new_section.len().saturating_sub(section_text.len()),
+    );
+    modified.extend_from_slice(&source[..section.start_byte()]);
+    modified.extend_from_slice(new_section.as_bytes());
+    modified.extend_from_slice(&source[section.end_byte()..]);
+
+    Ok((modified, new_section))
+}
+
+// ── nodes_at_line / section_for / ensure_custom_id ───────────────────────────
+
+/// Return all nodes matched by `scm` that span `line` (0-indexed row),
+/// picking the innermost (smallest byte span) when there are overlaps.
+/// This is the composable primitive underlying `section_for` and
+/// `ensure_custom_id`; expose it as an MCP tool if agents ever need to
+/// locate arbitrary node types (blocks, list items, …) by line.
+fn nodes_at_line<'tree>(
+    source: &[u8],
+    root: Node<'tree>,
+    scm: &str,
+    line: usize,
+) -> Result<Vec<Node<'tree>>> {
+    query_nodes(source, root, scm, |n, _| {
+        let start = n.start_position();
+        let end = n.end_position();
+        // end_position is an exclusive cursor: (row=R, col=0) means the node
+        // ends just before row R, so row R is NOT part of this node.
+        let contains = start.row <= line
+            && (line < end.row || (line == end.row && end.column > 0));
+        if contains { Some(n) } else { None }
+    })
+}
+
+fn find_section_containing_line<'tree>(
+    source: &[u8],
+    root: Node<'tree>,
+    line: usize,
+) -> Result<Option<Node<'tree>>> {
+    let hits = nodes_at_line(source, root, "(section) @section", line)?;
+    Ok(hits.into_iter().min_by_key(|n| n.end_byte() - n.start_byte()))
+}
+
+/// Resolve the innermost section that spans `line` (0-indexed row, as
+/// reported by `outline` / `query` `start_position.row`).
+pub fn section_for(source: &[u8], tree: &Tree, line: usize) -> Result<Option<SectionInfo>> {
+    let section = match find_section_containing_line(source, tree.root_node(), line)? {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let headline = section
+        .child_by_field_name("headline")
+        .ok_or_else(|| anyhow::anyhow!("section has no headline"))?;
+    let stars = headline
+        .child_by_field_name("stars")
+        .and_then(|s| s.utf8_text(source).ok())
+        .unwrap_or("");
+    let full_item = headline
+        .child_by_field_name("item")
+        .and_then(|i| i.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let (todo_keyword, title) = split_keyword(&full_item);
+    Ok(Some(SectionInfo {
+        title,
+        depth: stars.len(),
+        todo_keyword,
+        custom_id: section_custom_id(section, source),
+        breadcrumbs: breadcrumbs(section, source),
+        start_line: headline.start_position().row,
+        subtree: std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
+            .context("section text is not valid UTF-8")?
+            .to_string(),
+    }))
+}
+
+fn collect_custom_ids(source: &[u8], root: Node) -> Result<Vec<String>> {
+    query_nodes(
+        source,
+        root,
+        r#"(section (property_drawer (property
+            name: (expr) @_name (#match? @_name "(?i)^CUSTOM_ID$")))) @section"#,
+        |n, src| section_custom_id(n, src),
+    )
+}
+
+fn insert_custom_id_into_section(source: &[u8], section: Node, id: &str) -> Result<Vec<u8>> {
+    let existing_pd = section.child_by_field_name("property_drawer");
+
+    let (insert_pos, to_insert) = if let Some(pd) = existing_pd {
+        let pd_text = pd
+            .utf8_text(source)
+            .context("property drawer is not valid UTF-8")?;
+        let end_offset = pd_text
+            .find(":END:")
+            .ok_or_else(|| anyhow::anyhow!("property drawer missing :END:"))?;
+        (
+            pd.start_byte() + end_offset,
+            format!(":CUSTOM_ID: {id}\n"),
+        )
+    } else {
+        let headline = section
+            .child_by_field_name("headline")
+            .ok_or_else(|| anyhow::anyhow!("section has no headline"))?;
+        let mut c = section.walk();
+        let pos = section
+            .children(&mut c)
+            .find(|n| n.kind() == "plan")
+            .map(|n| n.end_byte())
+            .unwrap_or_else(|| headline.end_byte());
+        (pos, format!(":PROPERTIES:\n:CUSTOM_ID: {id}\n:END:\n"))
+    };
+
+    let mut result = Vec::with_capacity(source.len() + to_insert.len());
+    result.extend_from_slice(&source[..insert_pos]);
+    result.extend_from_slice(to_insert.as_bytes());
+    result.extend_from_slice(&source[insert_pos..]);
+    Ok(result)
+}
+
+pub struct EnsureCustomIdResult {
+    pub custom_id: String,
+    pub subtree: String,
+    pub file_content: Vec<u8>,
+    pub already_existed: bool,
+}
+
+/// Ensure the section spanning `line` (0-indexed row, as reported by
+/// `outline` / `query` `start_position.row`) has a `:CUSTOM_ID:` property.
+/// If one already exists it is returned unchanged. Otherwise `proposed_id` is
+/// checked for uniqueness across the file; a `-2`, `-3`, … suffix is appended
+/// if needed. Returns the assigned ID, the updated subtree text, the full
+/// modified file bytes, and whether the ID pre-existed.
+pub fn ensure_custom_id(
+    source: &[u8],
+    tree: &Tree,
+    line: usize,
+    proposed_id: &str,
+) -> Result<EnsureCustomIdResult> {
+    let root = tree.root_node();
+
+    let section = find_section_containing_line(source, root, line)?
+        .ok_or_else(|| anyhow::anyhow!("no section found at line {line}"))?;
+
+    if let Some(existing_id) = section_custom_id(section, source) {
+        let subtree =
+            std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
+                .context("section text is not valid UTF-8")?
+                .to_string();
+        return Ok(EnsureCustomIdResult {
+            custom_id: existing_id,
+            subtree,
+            file_content: source.to_vec(),
+            already_existed: true,
+        });
+    }
+
+    let existing_ids = collect_custom_ids(source, root)?;
+    let final_id = if !existing_ids.iter().any(|id| id == proposed_id) {
+        proposed_id.to_string()
+    } else {
+        let mut i = 2u32;
+        loop {
+            let candidate = format!("{proposed_id}-{i}");
+            if !existing_ids.iter().any(|id| id == &candidate) {
+                break candidate;
+            }
+            i += 1;
+        }
+    };
+
+    let file_content = insert_custom_id_into_section(source, section, &final_id)?;
+
+    let mut parser = crate::parser::make_parser()?;
+    let new_tree = parser
+        .parse(&file_content, None)
+        .ok_or_else(|| anyhow::anyhow!("failed to re-parse after CUSTOM_ID insertion"))?;
+    let subtree = get_subtree(&file_content, &new_tree, None, Some(&final_id))?;
+
+    Ok(EnsureCustomIdResult {
+        custom_id: final_id,
+        subtree,
+        file_content,
+        already_existed: false,
+    })
+}
+
 // ── org link parsing ──────────────────────────────────────────────────────────
 
 pub enum OrgLink {
@@ -384,4 +594,142 @@ pub fn parse_org_link(raw: &str) -> Result<OrgLink> {
     }
 
     bail!("unsupported link format: {raw:?}")
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::make_parser;
+
+    fn parse(src: &[u8]) -> tree_sitter::Tree {
+        let mut p = make_parser().unwrap();
+        p.parse(src, None).unwrap()
+    }
+
+    const ORG: &str = "\
+* Alpha
+:PROPERTIES:
+:CUSTOM_ID: alpha
+:END:
+Content of alpha.
+
+* Beta
+Content of beta without custom id.
+
+** Beta Sub
+:PROPERTIES:
+:CUSTOM_ID: beta-sub
+:END:
+Sub-section content.
+";
+
+    #[test]
+    fn patch_replaces_text_in_section() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let (new_bytes, new_text) =
+            patch_subtree(src, &tree, "alpha", "Content of alpha", "Updated content").unwrap();
+        assert!(new_text.contains("Updated content"));
+        assert!(!new_text.contains("Content of alpha"));
+        // Sections outside alpha are unchanged.
+        let rest = std::str::from_utf8(&new_bytes).unwrap();
+        assert!(rest.contains("Content of beta without custom id"));
+    }
+
+    #[test]
+    fn patch_errors_on_missing_id() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let err = patch_subtree(src, &tree, "nonexistent", "x", "y").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn patch_errors_when_search_not_found() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let err = patch_subtree(src, &tree, "alpha", "no such text", "y").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // ORG line layout (0-indexed rows):
+    //  0: * Alpha
+    //  1: :PROPERTIES:
+    //  2: :CUSTOM_ID: alpha
+    //  3: :END:
+    //  4: Content of alpha.
+    //  5: (blank)
+    //  6: * Beta
+    //  7: Content of beta without custom id.
+    //  8: (blank)
+    //  9: ** Beta Sub
+    // 10: :PROPERTIES:
+    // 11: :CUSTOM_ID: beta-sub
+    // 12: :END:
+    // 13: Sub-section content.
+
+    #[test]
+    fn section_for_returns_info() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let info = section_for(src, &tree, 4).unwrap().unwrap(); // row 4 inside Alpha
+        assert_eq!(info.title, "Alpha");
+        assert_eq!(info.depth, 1);
+        assert_eq!(info.custom_id.as_deref(), Some("alpha"));
+        assert_eq!(info.start_line, 0);
+        assert!(info.breadcrumbs.is_empty());
+    }
+
+    #[test]
+    fn section_for_picks_innermost() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // Row 13 is inside Beta Sub (depth 2), not Beta (depth 1).
+        let info = section_for(src, &tree, 13).unwrap().unwrap();
+        assert_eq!(info.title, "Beta Sub");
+        assert_eq!(info.breadcrumbs, vec!["Beta"]);
+    }
+
+    #[test]
+    fn ensure_custom_id_detects_existing() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // Row 0 is the Alpha headline which already has CUSTOM_ID "alpha".
+        let res = ensure_custom_id(src, &tree, 0, "anything").unwrap();
+        assert!(res.already_existed);
+        assert_eq!(res.custom_id, "alpha");
+    }
+
+    #[test]
+    fn ensure_custom_id_inserts_new() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // Row 7 is content inside Beta, which has no CUSTOM_ID.
+        let res = ensure_custom_id(src, &tree, 7, "beta").unwrap();
+        assert!(!res.already_existed);
+        assert_eq!(res.custom_id, "beta");
+        assert!(res.subtree.contains(":CUSTOM_ID: beta"));
+    }
+
+    #[test]
+    fn ensure_custom_id_disambiguates_collision() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // "alpha" is already taken; Beta should get "alpha-2".
+        let res = ensure_custom_id(src, &tree, 6, "alpha").unwrap();
+        assert!(!res.already_existed);
+        assert_eq!(res.custom_id, "alpha-2");
+    }
+
+    #[test]
+    fn ensure_custom_id_by_headline_row() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // Row 6 is the Beta headline itself — still resolves to the Beta section.
+        let res = ensure_custom_id(src, &tree, 6, "beta-new").unwrap();
+        assert!(!res.already_existed);
+        assert_eq!(res.custom_id, "beta-new");
+    }
 }
