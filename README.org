@@ -103,6 +103,7 @@ before committing to edits.
   programmatically.
 - Automated maintenance of large Org-based knowledge bases: bulk tag edits,
   property updates, deadline management, outline restructuring.
+  /(Not yet implemented — planned for future development.)/
 
 * Grammar Capabilities
 
