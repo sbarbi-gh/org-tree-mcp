@@ -277,70 +277,124 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str, patterns: &[Regex]
     Ok(results)
 }
 
-// ── get_subtree ───────────────────────────────────────────────────────────────
+// ── section_for / get_subtree ─────────────────────────────────────────────────
 
-fn find_section_by_path<'tree>(
+/// Return structured metadata for a section matched by all provided criteria
+/// (AND-ed). At least one of `heading_path`, `custom_id`, or `line` must be
+/// supplied. When multiple sections match, the innermost (smallest byte span)
+/// wins — so adding `line` to a `heading_path` that matches duplicate titles
+/// resolves the ambiguity without extra round-trips.
+pub fn section_for(
     source: &[u8],
-    root: Node<'tree>,
-    path: &[String],
-) -> Result<Option<Node<'tree>>> {
-    if path.is_empty() {
-        return Ok(None);
+    tree: &Tree,
+    heading_path: Option<&[String]>,
+    custom_id: Option<&str>,
+    line: Option<usize>,
+) -> Result<Option<SectionInfo>> {
+    if heading_path.is_none() && custom_id.is_none() && line.is_none() {
+        bail!("provide at least one of heading_path, custom_id, or line");
     }
-    let pat = Regex::new(&format!("(?i){}", path[0]))
-        .with_context(|| format!("invalid heading regex: {:?}", path[0]))?;
-    let root_id = root.id();
-    let found = query_nodes(source, root, "(section) @section", |n, src| {
-        if n.parent().map(|p| p.id()) != Some(root_id) {
-            return None;
+
+    // Pre-compile heading path patterns once outside the hot loop.
+    let path_patterns: Option<Vec<Regex>> = heading_path
+        .map(|path| {
+            path.iter()
+                .map(|p| {
+                    Regex::new(&format!("(?i){p}"))
+                        .map_err(|e| anyhow::anyhow!("invalid regex {p:?}: {e}"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    let hits = query_nodes(source, tree.root_node(), "(section) @section", |n, src| {
+        // heading_path: breadcrumbs + own title must each match the corresponding pattern
+        if let Some(ref patterns) = path_patterns {
+            let hl = n.child_by_field_name("headline")?;
+            let title = hl
+                .child_by_field_name("item")
+                .and_then(|i| i.utf8_text(src).ok())
+                .map(|t| split_keyword(t.trim()).1)
+                .unwrap_or_default();
+            let crumbs = breadcrumbs(n, src);
+            if crumbs.len() + 1 != patterns.len() {
+                return None;
+            }
+            let all_match = crumbs
+                .iter()
+                .chain(std::iter::once(&title))
+                .zip(patterns.iter())
+                .all(|(text, re)| re.is_match(text));
+            if !all_match {
+                return None;
+            }
         }
-        let title = n
-            .child_by_field_name("headline")
-            .and_then(|h| h.child_by_field_name("item"))
-            .and_then(|i| i.utf8_text(src).ok())
-            .map(|t| split_keyword(t.trim()).1)
-            .unwrap_or_default();
-        if pat.is_match(&title) { Some(n) } else { None }
+
+        // custom_id: section must carry exactly this CUSTOM_ID
+        if let Some(id) = custom_id {
+            if section_custom_id(n, src).as_deref() != Some(id) {
+                return None;
+            }
+        }
+
+        // line: section must span this 0-indexed row
+        if let Some(ln) = line {
+            let start = n.start_position();
+            let end = n.end_position();
+            let contains =
+                start.row <= ln && (ln < end.row || (ln == end.row && end.column > 0));
+            if !contains {
+                return None;
+            }
+        }
+
+        Some(n)
     })?;
-    match found.into_iter().next() {
-        None => Ok(None),
-        Some(child) if path.len() == 1 => Ok(Some(child)),
-        Some(child) => find_section_by_path(source, child, &path[1..]),
-    }
+
+    let section = match hits.into_iter().min_by_key(|n| n.end_byte() - n.start_byte()) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let headline = section
+        .child_by_field_name("headline")
+        .ok_or_else(|| anyhow::anyhow!("section has no headline"))?;
+    let stars = headline
+        .child_by_field_name("stars")
+        .and_then(|s| s.utf8_text(source).ok())
+        .unwrap_or("");
+    let full_item = headline
+        .child_by_field_name("item")
+        .and_then(|i| i.utf8_text(source).ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let (todo_keyword, title) = split_keyword(&full_item);
+
+    Ok(Some(SectionInfo {
+        title,
+        depth: stars.len(),
+        todo_keyword,
+        custom_id: section_custom_id(section, source),
+        breadcrumbs: breadcrumbs(section, source),
+        start_line: headline.start_position().row,
+        range: byte_range(&section),
+        subtree: std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
+            .context("section text is not valid UTF-8")?
+            .to_string(),
+    }))
 }
 
-fn find_section_by_custom_id<'tree>(
-    source: &[u8],
-    root: Node<'tree>,
-    id: &str,
-) -> Result<Option<Node<'tree>>> {
-    Ok(query_nodes(
-        source, root,
-        r#"(section (property_drawer (property
-            name: (expr) @_name (#match? @_name "(?i)^CUSTOM_ID$")))) @section"#,
-        |n, src| {
-            section_custom_id(n, src).filter(|v| v == id).map(|_| n)
-        },
-    )?.into_iter().next())
-}
-
+/// Return the full org text of a section. Used internally by `open_link`.
 pub fn get_subtree(
     source: &[u8],
     tree: &Tree,
     heading_path: Option<&[String]>,
     custom_id: Option<&str>,
 ) -> Result<String> {
-    let node = match (heading_path, custom_id) {
-        (Some(path), None) => find_section_by_path(source, tree.root_node(), path)?,
-        (None, Some(id)) => find_section_by_custom_id(source, tree.root_node(), id)?,
-        _ => bail!("provide exactly one of heading_path or custom_id"),
-    };
-    match node {
-        Some(n) => Ok(std::str::from_utf8(&source[n.start_byte()..n.end_byte()])
-            .context("section text is not valid UTF-8")?
-            .to_string()),
-        None => bail!("section not found"),
-    }
+    section_for(source, tree, heading_path, custom_id, None)?
+        .map(|info| info.subtree)
+        .ok_or_else(|| anyhow::anyhow!("section not found"))
 }
 
 // ── patch_subtree ─────────────────────────────────────────────────────────────
@@ -354,34 +408,30 @@ pub fn patch_subtree(
     search: &str,
     replace: &str,
 ) -> Result<(Vec<u8>, String)> {
-    let section = find_section_by_custom_id(source, tree.root_node(), custom_id)?
+    let info = section_for(source, tree, None, Some(custom_id), None)?
         .ok_or_else(|| anyhow::anyhow!("section with CUSTOM_ID {:?} not found", custom_id))?;
 
-    let section_text = std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
-        .context("section text is not valid UTF-8")?;
-
-    if !section_text.contains(search) {
+    if !info.subtree.contains(search) {
         bail!("search string not found in section {:?}", custom_id);
     }
 
-    let new_section = section_text.replace(search, replace);
+    let new_section = info.subtree.replace(search, replace);
     let mut modified = Vec::with_capacity(
-        source.len() + new_section.len().saturating_sub(section_text.len()),
+        source.len() + new_section.len().saturating_sub(info.subtree.len()),
     );
-    modified.extend_from_slice(&source[..section.start_byte()]);
+    modified.extend_from_slice(&source[..info.range.start]);
     modified.extend_from_slice(new_section.as_bytes());
-    modified.extend_from_slice(&source[section.end_byte()..]);
+    modified.extend_from_slice(&source[info.range.end..]);
 
     Ok((modified, new_section))
 }
 
-// ── nodes_at_line / section_for / ensure_custom_id ───────────────────────────
+// ── nodes_at_line / ensure_custom_id ─────────────────────────────────────────
 
 /// Return all nodes matched by `scm` that span `line` (0-indexed row),
 /// picking the innermost (smallest byte span) when there are overlaps.
-/// This is the composable primitive underlying `section_for` and
-/// `ensure_custom_id`; expose it as an MCP tool if agents ever need to
-/// locate arbitrary node types (blocks, list items, …) by line.
+/// Composable primitive; expose as an MCP tool if agents ever need to locate
+/// arbitrary node types (blocks, list items, …) by line.
 fn nodes_at_line<'tree>(
     source: &[u8],
     root: Node<'tree>,
@@ -406,40 +456,6 @@ fn find_section_containing_line<'tree>(
 ) -> Result<Option<Node<'tree>>> {
     let hits = nodes_at_line(source, root, "(section) @section", line)?;
     Ok(hits.into_iter().min_by_key(|n| n.end_byte() - n.start_byte()))
-}
-
-/// Resolve the innermost section that spans `line` (0-indexed row, as
-/// reported by `outline` / `query` `start_position.row`).
-pub fn section_for(source: &[u8], tree: &Tree, line: usize) -> Result<Option<SectionInfo>> {
-    let section = match find_section_containing_line(source, tree.root_node(), line)? {
-        Some(n) => n,
-        None => return Ok(None),
-    };
-    let headline = section
-        .child_by_field_name("headline")
-        .ok_or_else(|| anyhow::anyhow!("section has no headline"))?;
-    let stars = headline
-        .child_by_field_name("stars")
-        .and_then(|s| s.utf8_text(source).ok())
-        .unwrap_or("");
-    let full_item = headline
-        .child_by_field_name("item")
-        .and_then(|i| i.utf8_text(source).ok())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let (todo_keyword, title) = split_keyword(&full_item);
-    Ok(Some(SectionInfo {
-        title,
-        depth: stars.len(),
-        todo_keyword,
-        custom_id: section_custom_id(section, source),
-        breadcrumbs: breadcrumbs(section, source),
-        start_line: headline.start_position().row,
-        subtree: std::str::from_utf8(&source[section.start_byte()..section.end_byte()])
-            .context("section text is not valid UTF-8")?
-            .to_string(),
-    }))
 }
 
 fn collect_custom_ids(source: &[u8], root: Node) -> Result<Vec<String>> {
@@ -671,10 +687,10 @@ Sub-section content.
     // 13: Sub-section content.
 
     #[test]
-    fn section_for_returns_info() {
+    fn section_for_by_line() {
         let src = ORG.as_bytes();
         let tree = parse(src);
-        let info = section_for(src, &tree, 4).unwrap().unwrap(); // row 4 inside Alpha
+        let info = section_for(src, &tree, None, None, Some(4)).unwrap().unwrap();
         assert_eq!(info.title, "Alpha");
         assert_eq!(info.depth, 1);
         assert_eq!(info.custom_id.as_deref(), Some("alpha"));
@@ -683,11 +699,39 @@ Sub-section content.
     }
 
     #[test]
-    fn section_for_picks_innermost() {
+    fn section_for_by_custom_id() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let info = section_for(src, &tree, None, Some("beta-sub"), None).unwrap().unwrap();
+        assert_eq!(info.title, "Beta Sub");
+        assert_eq!(info.breadcrumbs, vec!["Beta"]);
+    }
+
+    #[test]
+    fn section_for_by_heading_path() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        let path = vec!["Beta".to_string(), "Beta Sub".to_string()];
+        let info = section_for(src, &tree, Some(&path), None, None).unwrap().unwrap();
+        assert_eq!(info.title, "Beta Sub");
+    }
+
+    #[test]
+    fn section_for_heading_path_and_line_combined() {
+        let src = ORG.as_bytes();
+        let tree = parse(src);
+        // heading_path matches "Beta" AND line is inside Beta (not Beta Sub) — innermost wins
+        let path = vec!["Beta".to_string()];
+        let info = section_for(src, &tree, Some(&path), None, Some(7)).unwrap().unwrap();
+        assert_eq!(info.title, "Beta");
+    }
+
+    #[test]
+    fn section_for_picks_innermost_by_line() {
         let src = ORG.as_bytes();
         let tree = parse(src);
         // Row 13 is inside Beta Sub (depth 2), not Beta (depth 1).
-        let info = section_for(src, &tree, 13).unwrap().unwrap();
+        let info = section_for(src, &tree, None, None, Some(13)).unwrap().unwrap();
         assert_eq!(info.title, "Beta Sub");
         assert_eq!(info.breadcrumbs, vec!["Beta"]);
     }

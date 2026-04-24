@@ -56,6 +56,8 @@ pub struct SectionInfo {
     pub breadcrumbs: Vec<String>,
     /// 0-indexed row of the headline.
     pub start_line: usize,
+    /// Byte range of the section within the file. Ephemeral — re-parse to re-anchor.
+    pub range: ByteRange,
     /// Full org text of the section (headline + contents + subsections).
     pub subtree: String,
 }

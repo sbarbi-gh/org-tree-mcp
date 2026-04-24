@@ -38,12 +38,15 @@ struct SubtreeParams {
     /// Absolute path to the org file.
     file: String,
     /// Heading title path from root to target section, e.g. ["Results", "PCA"].
-    /// Each element is a case-insensitive regex matched against the headline
-    /// title (TODO keyword stripped). Use this OR custom_id.
+    /// Each element is a case-insensitive regex. May be combined with `line`
+    /// for disambiguation when duplicate titles exist in the hierarchy.
     heading_path: Option<Vec<String>>,
     /// Value of the :CUSTOM_ID: property of the target section.
-    /// Use this OR heading_path.
     custom_id: Option<String>,
+    /// 0-indexed row (start_position.row from outline / query results). Any row
+    /// inside the section — including its headline row — resolves to the
+    /// innermost enclosing section. May be combined with heading_path.
+    line: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -56,14 +59,6 @@ struct PatchSubtreeParams {
     search: String,
     /// Replacement string.
     replace: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-struct SectionForParams {
-    /// Absolute path to the org file.
-    file: String,
-    /// 0-indexed row (start_position.row from outline / query results).
-    line: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -159,16 +154,21 @@ impl OrgMcpServer {
         }
     }
 
-    /// Return the raw org text of a subtree identified by a heading path or
-    /// CUSTOM_ID property. Each heading_path element is a case-insensitive
-    /// regex matched against the cleaned headline title (TODO keyword
-    /// stripped). Provide exactly one of heading_path or custom_id.
-    #[tool(description = "Get the full org text of a subtree by heading path or CUSTOM_ID.")]
+    /// Return structured metadata and full org text for a section. Criteria are
+    /// AND-ed: supply any combination of heading_path (case-insensitive regex
+    /// per level, combined with line to resolve duplicate titles), custom_id,
+    /// or line (0-indexed row from outline / query start_position.row). At
+    /// least one must be provided. When multiple sections match, the innermost
+    /// (smallest byte span) is returned.
+    #[tool(description = "Get section metadata and full org text by heading_path, custom_id, line (0-indexed row), or any combination.")]
     async fn subtree(&self, Parameters(p): Parameters<SubtreeParams>) -> String {
         let heading_path = p.heading_path;
         let custom_id = p.custom_id;
+        let line = p.line;
         match parse_and_run(&p.file, |src, tree| {
-            get_subtree(src, tree, heading_path.as_deref(), custom_id.as_deref())
+            let info = org_section_for(src, tree, heading_path.as_deref(), custom_id.as_deref(), line)?
+                .ok_or_else(|| anyhow::anyhow!("section not found"))?;
+            Ok(serde_json::to_string_pretty(&info)?)
         }) {
             Ok(s) => s,
             Err(e) => error_json(&e.to_string()),
@@ -209,22 +209,6 @@ impl OrgMcpServer {
         }
     }
 
-    /// Resolve the innermost org section that spans `line` (0-indexed row, as
-    /// reported by `outline` / `query` `start_position.row`). Returns section
-    /// metadata: title, depth, TODO keyword, existing CUSTOM_ID (if any),
-    /// breadcrumb ancestors, and the full subtree text. Useful for turning any
-    /// query match into its enclosing section without needing a CUSTOM_ID.
-    #[tool(description = "Return metadata and subtree text for the section that contains the given 0-indexed line (start_position.row from outline/query results).")]
-    async fn section_for(&self, Parameters(p): Parameters<SectionForParams>) -> String {
-        match parse_and_run(&p.file, |src, tree| {
-            let info = org_section_for(src, tree, p.line)?;
-            Ok(serde_json::to_string_pretty(&info)?)
-        }) {
-            Ok(s) => s,
-            Err(e) => error_json(&e.to_string()),
-        }
-    }
-
     /// Ensure the section containing `line` (0-indexed row) has a `:CUSTOM_ID:`
     /// property. If one already exists it is returned unchanged. Otherwise
     /// `custom_id` is checked for uniqueness across the file; a `-2`, `-3`, …
@@ -254,13 +238,14 @@ kept. All query results include the source file path, breadcrumb paths, and a \
 context snippet; the snippet width adapts to match density and proximity to \
 the nearest heading. Byte ranges are ephemeral — re-run the query if the file \
 may have changed. For stable cross-call references, use CUSTOM_ID properties \
-in org section drawers. Use `patch_subtree` to apply a literal \
-search-and-replace within a section identified by CUSTOM_ID, writing the \
-result back to the file. Use `section_for` to resolve any 0-indexed line \
-(start_position.row from outline/query results) to its enclosing section \
-metadata and subtree text — useful before assigning a CUSTOM_ID. Use \
-`ensure_custom_id` to add a :CUSTOM_ID: to a section identified by \
-0-indexed line, with automatic disambiguation if the proposed ID is taken."
+in org section drawers. Use `subtree` to retrieve a section's full metadata and org text; it accepts \
+any combination of heading_path, custom_id, or line (0-indexed row from \
+outline/query start_position.row) as AND-ed criteria — supply line alongside \
+heading_path to resolve duplicate titles. Use `patch_subtree` to apply a \
+literal search-and-replace within a section identified by CUSTOM_ID, writing \
+the result back to the file. Use `ensure_custom_id` to add a :CUSTOM_ID: to \
+a section identified by 0-indexed line, with automatic disambiguation if the \
+proposed ID is already taken."
 )]
 impl ServerHandler for OrgMcpServer {}
 
