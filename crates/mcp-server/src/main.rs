@@ -8,8 +8,10 @@ use std::path::Path;
 
 use org_parser::{
     ensure_custom_id as org_ensure_custom_id, make_parser, outline, parse_org_link,
-    patch_subtree as org_patch_subtree, run_query, section_for as org_section_for,
-    EnsureCustomIdResult, OrgLink, QueryMatch, SectionInfo,
+    patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
+    resolve_section_ref, run_query, validate as org_validate,
+    Dest, EnsureCustomIdResult, OrgLink, QueryMatch, RefileOutput, SectionInfo,
+    SectionRef,
 };
 
 // ── parameter types ───────────────────────────────────────────────────────────
@@ -38,14 +40,13 @@ struct SubtreeParams {
     /// Absolute path to the org file.
     file: String,
     /// Heading title path from root to target section, e.g. ["Results", "PCA"].
-    /// Each element is a case-insensitive regex. May be combined with `line`
-    /// for disambiguation when duplicate titles exist in the hierarchy.
+    /// Each element is a case-insensitive regex.
     heading_path: Option<Vec<String>>,
     /// Value of the :CUSTOM_ID: property of the target section.
     custom_id: Option<String>,
     /// 0-indexed row (start_position.row from outline / query results). Any row
     /// inside the section — including its headline row — resolves to the
-    /// innermost enclosing section. May be combined with heading_path.
+    /// innermost enclosing section.
     line: Option<usize>,
 }
 
@@ -87,6 +88,30 @@ struct OpenLinkParams {
     /// paths. A file path is accepted (its parent directory is used) as well
     /// as a bare directory path.
     base_file: Option<String>,
+}
+
+/// Deserialize T from either a proper JSON object or a JSON-encoded string.
+/// Works around MCP clients that stringify complex tool parameters.
+fn from_str_or_obj<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = serde_json::Value::deserialize(deserializer).map_err(serde::de::Error::custom)?;
+    match v {
+        serde_json::Value::String(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct RefileSubtreeParams {
+    /// Section to move.  `src.file` is always required (no SameFile for src).
+    #[serde(deserialize_with = "from_str_or_obj")]
+    src: SectionRef,
+    /// Destination placement.
+    #[serde(deserialize_with = "from_str_or_obj")]
+    dest: Dest,
 }
 
 // ── per-file match with path ──────────────────────────────────────────────────
@@ -172,20 +197,24 @@ impl OrgMcpServer {
         }
     }
 
-    /// Return structured metadata and full org text for a section. Criteria are
-    /// AND-ed: supply any combination of heading_path (case-insensitive regex
-    /// per level, combined with line to resolve duplicate titles), custom_id,
-    /// or line (0-indexed row from outline / query start_position.row). At
-    /// least one must be provided. When multiple sections match, the innermost
-    /// (smallest byte span) is returned.
-    #[tool(description = "Get section metadata and full org text by heading_path, custom_id, line (0-indexed row), or any combination.")]
+    /// Return structured metadata and full org text for a section identified by
+    /// exactly one of: custom_id (preferred), line (0-indexed row from outline /
+    /// query start_position.row), or heading_path (case-insensitive regex per
+    /// level from the document root). Priority: custom_id > line > heading_path.
+    #[tool(description = "Get section metadata and full org text by heading_path, custom_id, or line (0-indexed row). Priority when multiple are given: custom_id > line > heading_path.")]
     async fn subtree(&self, Parameters(p): Parameters<SubtreeParams>) -> String {
-        let heading_path = p.heading_path;
-        let custom_id = p.custom_id;
-        let line = p.line;
-        match parse_and_run(&p.file, |src, tree| {
-            let info = org_section_for(src, tree, heading_path.as_deref(), custom_id.as_deref(), line)?
-                .ok_or_else(|| anyhow::anyhow!("section not found"))?;
+        let file = p.file.clone();
+        let r = if let Some(id) = p.custom_id {
+            SectionRef::Id { file: None, id }
+        } else if let Some(n) = p.line {
+            SectionRef::Line { file: None, line: n }
+        } else if let Some(path) = p.heading_path {
+            SectionRef::Path { file: None, path }
+        } else {
+            return error_json("provide at least one of custom_id, line, or heading_path");
+        };
+        match parse_and_run(&file, |src, tree| {
+            let info = resolve_section_ref(src, tree, &r)?;
             Ok(serde_json::to_string_pretty(&info)?)
         }) {
             Ok(s) => s,
@@ -240,6 +269,32 @@ impl OrgMcpServer {
             Err(e) => error_json(&e.to_string()),
         }
     }
+
+    /// Move a section (identified by its CUSTOM_ID in the source file) to a new
+    /// location in the same or a different org file.  The source section is
+    /// deleted from `src.file`; the depth-adjusted subtree is inserted at the
+    /// position described by `dest`.  Both files are written atomically only
+    /// after validation succeeds.
+    ///
+    /// `dest.placement` is the discriminant that controls all other `dest` fields:
+    ///   - `before` / `after`       — sibling of a section; requires `dest.custom_id`
+    ///   - `child_first` / `child_last` — child of a section; requires `dest.custom_id`
+    ///   - `doc_first` / `doc_last` — top-level in the file; no `dest.custom_id`
+    ///
+    /// If the section's CUSTOM_ID already exists in the destination file it is
+    /// automatically disambiguated (suffix `-2`, `-3`, …).  The destination file
+    /// must already exist; create it before calling this tool if needed.
+    ///
+    /// Returns `{ src: {file, custom_id, title}, dest: {file, custom_id, line},
+    ///   custom_id_changed, validation: {errors, warnings} }`.
+    /// Use the returned `dest` to compose a link at the original location.
+    #[tool(description = "Move a section (by CUSTOM_ID) within or between org files, adjusting heading depth and disambiguating CUSTOM_ID collisions automatically.")]
+    async fn refile_subtree(&self, Parameters(p): Parameters<RefileSubtreeParams>) -> String {
+        match run_refile(&p.src, &p.dest) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
 }
 
 #[tool_handler(
@@ -266,7 +321,13 @@ heading_path to resolve duplicate titles. Use `patch_subtree` to apply a \
 literal search-and-replace within a section identified by CUSTOM_ID, writing \
 the result back to the file. Use `ensure_custom_id` to add a :CUSTOM_ID: to \
 a section identified by 0-indexed line, with automatic disambiguation if the \
-proposed ID is already taken."
+proposed ID is already taken. Use `refile_subtree` to move a section \
+(identified by CUSTOM_ID) within or across org files: the section is removed \
+from src, depth-adjusted to fit the destination nesting level, and inserted \
+according to `dest.placement` (before/after a sibling, child_first/child_last \
+inside a section, or doc_first/doc_last at the file root). CUSTOM_ID \
+collisions in the destination are auto-disambiguated; the final CUSTOM_ID and \
+line number are returned so you can insert a link at the original location."
 )]
 impl ServerHandler for OrgMcpServer {}
 
@@ -351,30 +412,23 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String
             .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))
             .map(str::to_string)
     };
-    let section_json = |file: String, heading_path: Option<Vec<String>>, custom_id: Option<String>| -> anyhow::Result<String> {
-        let file_for_result = file.clone();
-        parse_and_run(&file, move |src, tree| {
-            let info = org_section_for(src, tree, heading_path.as_deref(), custom_id.as_deref(), None)?
-                .ok_or_else(|| anyhow::anyhow!("section not found"))?;
-            Ok(serde_json::to_string_pretty(&LinkedSection { file: file_for_result, info })?)
-        })
-    };
-
     match parse_org_link(link)? {
-        OrgLink::SameFileId(id) => {
-            section_json(require_base()?, None, Some(id))
+        OrgLink::Section(r) => {
+            let file = match r.file() {
+                Some(f) => resolve(f)?,
+                None => require_base()?,
+            };
+            let file_for_result = file.clone();
+            parse_and_run(&file, move |src, tree| {
+                let info = resolve_section_ref(src, tree, &r)?;
+                Ok(serde_json::to_string_pretty(&LinkedSection { file: file_for_result, info })?)
+            })
         }
-        OrgLink::File(f) => {
-            let file = resolve(&f)?;
+        OrgLink::Document(path) => {
+            let file = resolve(&path)?;
             let content = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
             Ok(serde_json::to_string_pretty(&LinkedFile { file, content })?)
-        }
-        OrgLink::FileId { file: f, id } => {
-            section_json(resolve(&f)?, None, Some(id))
-        }
-        OrgLink::FilePath { file: f, path } => {
-            section_json(resolve(&f)?, Some(path), None)
         }
     }
 }
@@ -386,7 +440,15 @@ fn run_patch(file: &str, custom_id: &str, search: &str, replace: &str) -> anyhow
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, custom_id, search, replace)?;
+    let r = SectionRef::Id { file: None, id: custom_id.to_string() };
+    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, &r, search, replace)?;
+    let report = org_validate(&modified_bytes)?;
+    if report.has_errors() {
+        anyhow::bail!(
+            "write aborted — validation errors: {}",
+            report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
+        );
+    }
     std::fs::write(file, &modified_bytes)
         .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
     Ok(new_section)
@@ -399,9 +461,17 @@ fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::R
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
+    let r = SectionRef::Line { file: None, line };
     let EnsureCustomIdResult { custom_id, subtree, file_content, already_existed } =
-        org_ensure_custom_id(&source, &tree, line, proposed_id)?;
+        org_ensure_custom_id(&source, &tree, &r, proposed_id)?;
     if !already_existed {
+        let report = org_validate(&file_content)?;
+        if report.has_errors() {
+            anyhow::bail!(
+                "write aborted — validation errors: {}",
+                report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
+            );
+        }
         std::fs::write(file, &file_content)
             .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
     }
@@ -409,6 +479,49 @@ fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::R
         "custom_id": custom_id,
         "already_existed": already_existed,
         "subtree": subtree,
+    }))?)
+}
+
+fn run_refile(src_ref: &SectionRef, dest: &Dest) -> anyhow::Result<String> {
+    let RefileOutput {
+        src_file,
+        dest_file,
+        src_bytes,
+        dest_bytes,
+        final_custom_id,
+        custom_id_changed,
+        dest_start_line,
+        src_title,
+        validation,
+    } = org_refile_subtree(src_ref, dest)?;
+
+    if validation.has_errors() {
+        anyhow::bail!(
+            "write aborted — validation errors: {}",
+            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
+        );
+    }
+
+    let same_file = src_file == dest_file;
+    if same_file {
+        std::fs::write(&dest_file, &dest_bytes)
+            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
+    } else {
+        std::fs::write(&src_file, &src_bytes)
+            .map_err(|e| anyhow::anyhow!("cannot write {src_file}: {e}"))?;
+        std::fs::write(&dest_file, &dest_bytes)
+            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
+    }
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "src": { "file": src_file, "title": src_title },
+        "dest": {
+            "file": dest_file,
+            "custom_id": final_custom_id,
+            "line": dest_start_line,
+        },
+        "custom_id_changed": custom_id_changed,
+        "validation": validation,
     }))?)
 }
 
