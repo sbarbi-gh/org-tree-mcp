@@ -1,4 +1,5 @@
 use anyhow::Result;
+use regex::Regex;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use rmcp::handler::server::wrapper::Parameters;
 use schemars::JsonSchema;
@@ -17,10 +18,15 @@ struct OutlineParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct QueryParams {
-    /// Absolute path to the org file.
-    file: String,
+    /// Absolute path to an org file, or a directory to search recursively.
+    path: String,
     /// Tree-sitter S-expression query string.
     query: String,
+    /// Optional regex patterns applied to matched text after structural
+    /// filtering. A result is kept if its text matches at least one pattern.
+    /// When multiple structural nodes cover the same regex hit, only the node
+    /// with the smallest byte range (most specific) is returned.
+    patterns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -34,14 +40,6 @@ struct SubtreeParams {
     /// Value of the :CUSTOM_ID: property of the target section.
     /// Use this OR heading_path.
     custom_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-struct SearchDirParams {
-    /// Directory to search recursively for *.org files.
-    dir: String,
-    /// Tree-sitter S-expression query string.
-    query: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -86,20 +84,41 @@ impl OrgMcpServer {
         }
     }
 
-    /// Run an arbitrary tree-sitter S-expression query against an org file.
-    /// Returns a JSON array of matches, each with capture name, text, byte
-    /// range, source position, and breadcrumb path through parent headlines.
+    /// Run a tree-sitter S-expression query against an org file or every
+    /// *.org file in a directory (recursively). `path` may be a file or a
+    /// directory. Returns a JSON array of matches, each annotated with the
+    /// source file path, capture name, text, byte range, source position, and
+    /// breadcrumb path through parent headlines. Optionally supply `patterns`
+    /// to further filter results to nodes whose text matches at least one
+    /// regex; when multiple structural nodes cover the same hit the most
+    /// specific (smallest byte range) is kept.
     ///
     /// Use the `query_examples` tool to see documented patterns for the org
     /// grammar.
-    #[tool(description = "Run a tree-sitter S-expression query against an org file.")]
+    #[tool(description = "Run a tree-sitter S-expression query against an org file or a directory of org files.")]
     async fn query(&self, Parameters(p): Parameters<QueryParams>) -> String {
-        match parse_and_run(&p.file, |src, tree| {
-            let matches = run_query(src, tree, &p.query)?;
-            Ok(serde_json::to_string_pretty(&matches)?)
-        }) {
-            Ok(s) => s,
-            Err(e) => error_json(&e.to_string()),
+        let patterns = match compile_patterns(p.patterns.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return error_json(&e.to_string()),
+        };
+        if Path::new(&p.path).is_dir() {
+            match search_directory(&p.path, &p.query, &patterns) {
+                Ok(s) => s,
+                Err(e) => error_json(&e.to_string()),
+            }
+        } else {
+            let file = p.path.clone();
+            match parse_and_run(&p.path, |src, tree| {
+                let matches = run_query(src, tree, &p.query, &patterns)?;
+                let file_matches: Vec<FileMatch> = matches
+                    .into_iter()
+                    .map(|m| FileMatch { file: file.clone(), m })
+                    .collect();
+                Ok(serde_json::to_string_pretty(&file_matches)?)
+            }) {
+                Ok(s) => s,
+                Err(e) => error_json(&e.to_string()),
+            }
         }
     }
 
@@ -119,22 +138,8 @@ impl OrgMcpServer {
         }
     }
 
-    /// Run a tree-sitter S-expression query across every *.org file in a
-    /// directory (recursively). Returns a JSON array of matches, each
-    /// annotated with the source file path, capture name, text, byte range,
-    /// and breadcrumb path. Use this for bottom-up retrieval across a library
-    /// of org files.
-    #[tool(description = "Search all *.org files in a directory with a tree-sitter query.")]
-    async fn search_dir(&self, Parameters(p): Parameters<SearchDirParams>) -> String {
-        match search_directory(&p.dir, &p.query) {
-            Ok(s) => s,
-            Err(e) => error_json(&e.to_string()),
-        }
-    }
-
     /// Return a catalogue of documented tree-sitter query examples for the
-    /// org grammar. Use these as starting points for the `query` and
-    /// `search_dir` tools.
+    /// org grammar. Use these as starting points for the `query` tool.
     #[tool(description = "List documented tree-sitter query examples for the org grammar.")]
     async fn query_examples(&self) -> String {
         QUERY_EXAMPLES.to_string()
@@ -162,15 +167,17 @@ impl OrgMcpServer {
     version = "0.1.0",
     instructions = "Structural navigation and querying of Org mode files via tree-sitter. \
 Use `outline` to orient in a document, `query` to run precise S-expression \
-queries, `subtree` to retrieve a section's full text, `search_dir` to find \
-matching nodes across a library of org files, `open_link` to follow an \
-Org-mode link (CUSTOM_ID, heading path, or bare file) and retrieve its full \
-content, and `query_examples` to discover useful query patterns. All query \
-results include breadcrumb paths and a context snippet showing the surrounding \
-source lines; the snippet width adapts to match density and proximity to the \
-nearest heading. Byte ranges are ephemeral — re-run the query if the file may \
-have changed. For stable cross-call references, use CUSTOM_ID properties in \
-org section drawers."
+queries against a single file or an entire directory of org files, `subtree` \
+to retrieve a section's full text, `open_link` to follow an Org-mode link \
+(CUSTOM_ID, heading path, or bare file) and retrieve its full content, and \
+`query_examples` to discover useful query patterns. `query` accepts an \
+optional `patterns` list to filter results by regex after structural matching; \
+when the same text span is covered by multiple nodes the most specific one is \
+kept. All query results include the source file path, breadcrumb paths, and a \
+context snippet; the snippet width adapts to match density and proximity to \
+the nearest heading. Byte ranges are ephemeral — re-run the query if the file \
+may have changed. For stable cross-call references, use CUSTOM_ID properties \
+in org section drawers."
 )]
 impl ServerHandler for OrgMcpServer {}
 
@@ -189,11 +196,18 @@ where
     f(&source, &tree)
 }
 
-fn search_directory(dir: &str, query_src: &str) -> anyhow::Result<String> {
+fn compile_patterns(raw: Option<&[String]>) -> anyhow::Result<Vec<Regex>> {
+    raw.unwrap_or(&[])
+        .iter()
+        .map(|p| Regex::new(p).map_err(|e| anyhow::anyhow!("invalid pattern {p:?}: {e}")))
+        .collect()
+}
+
+fn search_directory(dir: &str, query_src: &str, patterns: &[Regex]) -> anyhow::Result<String> {
     let mut all: Vec<FileMatch> = Vec::new();
     for path in collect_org_files_in(Path::new(dir))? {
         let path_str = path.to_string_lossy().to_string();
-        match parse_and_run(&path_str, |src, tree| run_query(src, tree, query_src)) {
+        match parse_and_run(&path_str, |src, tree| run_query(src, tree, query_src, patterns)) {
             Ok(matches) => {
                 for m in matches {
                     all.push(FileMatch { file: path_str.clone(), m });

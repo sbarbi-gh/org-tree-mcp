@@ -177,9 +177,59 @@ pub fn outline(source: &[u8], tree: &Tree) -> Result<Vec<HeadlineEntry>> {
 
 // ── run_query ─────────────────────────────────────────────────────────────────
 
+/// Keep only results whose text matches at least one pattern, preferring the
+/// structurally narrowest node (smallest byte range) for each regex hit span.
+fn filter_by_patterns(results: Vec<QueryMatch>, patterns: &[Regex]) -> Vec<QueryMatch> {
+    if patterns.is_empty() {
+        return results;
+    }
+
+    // Absolute byte spans of every regex hit within each result's text.
+    let result_spans: Vec<Vec<(usize, usize)>> = results
+        .iter()
+        .map(|qm| {
+            let base = qm.range.start;
+            patterns
+                .iter()
+                .flat_map(|pat| {
+                    pat.find_iter(&qm.text)
+                        .map(move |m| (base + m.start(), base + m.end()))
+                })
+                .collect()
+        })
+        .collect();
+
+    // For each hit span, elect the result with the smallest enclosing byte range.
+    let mut span_winner: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for (i, spans) in result_spans.iter().enumerate() {
+        let size = results[i].range.end - results[i].range.start;
+        for &span in spans {
+            span_winner
+                .entry(span)
+                .and_modify(|w| {
+                    let w_size = results[*w].range.end - results[*w].range.start;
+                    if size < w_size {
+                        *w = i;
+                    }
+                })
+                .or_insert(i);
+        }
+    }
+
+    let winners: std::collections::HashSet<usize> = span_winner.values().copied().collect();
+    results
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| winners.contains(i))
+        .map(|(_, qm)| qm)
+        .collect()
+}
+
 /// Execute an arbitrary tree-sitter S-expression query.
-/// Returns one [`QueryMatch`] per capture per pattern match.
-pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<QueryMatch>> {
+/// Returns one [`QueryMatch`] per capture per pattern match, optionally
+/// filtered to results whose text matches at least one of `patterns`.
+pub fn run_query(source: &[u8], tree: &Tree, query_src: &str, patterns: &[Regex]) -> Result<Vec<QueryMatch>> {
     let (query, mut cursor) = make_cursor(query_src)?;
     let mut results = Vec::new();
     let mut match_id = 0usize;
@@ -208,6 +258,9 @@ pub fn run_query(source: &[u8], tree: &Tree, query_src: &str) -> Result<Vec<Quer
     if cursor.did_exceed_match_limit() {
         eprintln!("warn: query match limit exceeded — results may be incomplete");
     }
+
+    // Filter before context window so density heuristic reflects final count.
+    let mut results = filter_by_patterns(results, patterns);
 
     let src_str = std::str::from_utf8(source).unwrap_or("");
     let lines: Vec<&str> = src_str.lines().collect();
