@@ -351,10 +351,34 @@ pub fn section_for(
         Some(n)
     })?;
 
-    let section = match hits.into_iter().min_by_key(|n| n.end_byte() - n.start_byte()) {
-        Some(n) => n,
+    // Nested hits (parent + child both spanning the same line) are expected:
+    // pick the innermost. Sibling hits mean the criteria are ambiguous → error.
+    let innermost = match hits.iter().min_by_key(|n| n.end_byte() - n.start_byte()) {
+        Some(n) => *n,
         None => return Ok(None),
     };
+    for hit in &hits {
+        if hit.id() == innermost.id() {
+            continue;
+        }
+        // Every non-innermost hit must be an ancestor of the innermost.
+        let mut cur = innermost.parent();
+        let is_ancestor = loop {
+            match cur {
+                Some(p) if p.id() == hit.id() => break true,
+                Some(p) => cur = p.parent(),
+                None => break false,
+            }
+        };
+        if !is_ancestor {
+            bail!(
+                "ambiguous: {} sections matched the given criteria; \
+                 add `line` or `custom_id` to disambiguate",
+                hits.len()
+            );
+        }
+    }
+    let section = innermost;
 
     let headline = section
         .child_by_field_name("headline")
@@ -731,9 +755,46 @@ Sub-section content.
         let src = ORG.as_bytes();
         let tree = parse(src);
         // Row 13 is inside Beta Sub (depth 2), not Beta (depth 1).
+        // Both sections span row 13, but Beta Sub is nested inside Beta →
+        // valid nesting, pick the innermost.
         let info = section_for(src, &tree, None, None, Some(13)).unwrap().unwrap();
         assert_eq!(info.title, "Beta Sub");
         assert_eq!(info.breadcrumbs, vec!["Beta"]);
+    }
+
+    #[test]
+    fn section_for_errors_on_ambiguous_siblings() {
+        // Two sibling sections with the same heading "Results".
+        let src = b"\
+* Results
+Content A.
+
+* Results
+Content B.
+";
+        let tree = parse(src);
+        let path = vec!["Results".to_string()];
+        let err = section_for(src, &tree, Some(&path), None, None).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn section_for_disambiguates_siblings_with_line() {
+        let src = b"\
+* Results
+Content A.
+
+* Results
+Content B.
+";
+        let tree = parse(src);
+        let path = vec!["Results".to_string()];
+        // Row 1 is inside the first "Results" section.
+        let info = section_for(src, &tree, Some(&path), None, Some(1)).unwrap().unwrap();
+        assert_eq!(info.start_line, 0);
+        // Row 4 is inside the second "Results" section.
+        let info2 = section_for(src, &tree, Some(&path), None, Some(4)).unwrap().unwrap();
+        assert_eq!(info2.start_line, 3);
     }
 
     #[test]
