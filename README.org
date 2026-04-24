@@ -15,14 +15,23 @@ precise and composable.
 
 * Design Principles
 
-** Structural with regex complement
+** Structural queries with post-structural text filtering
 
 Queries operate on the parsed syntax tree rather than raw text.  Headlines,
 sections, blocks, drawers, timestamps, tags, and properties are all
 first-class nodes.  This eliminates an entire class of fragile regex-over-lines
-approaches. Regular expressions (~#match?~, ~#eq?~) complement the structural
-matching to handle parser fragility and real-world edge cases where the syntax
-tree alone is insufficient.
+approaches.
+
+Within a tree-sitter query, ~#match?~ and ~#eq?~ predicates are used only to
+restrict by *structural type values* — for example, matching the block keyword
+~#+begin_src~ or pinning the language to ~python~.  They are not the right tool
+for searching free-form text content.
+
+For text search the ~query~ tool accepts an optional ~patterns~ list: each
+element is a regular expression applied to the matched node's text after
+structural filtering.  All patterns must match (AND semantics), and their order
+is irrelevant, so a list of keywords finds sections that contain all of them in
+any arrangement.
 
 ** Hybrid query API
 
@@ -163,16 +172,23 @@ the predicate works without the wildcard.
     item: (item) @title))
 #+end_src
 
-** Headlines matching a pattern
+** Headlines matching text keywords
 
-Use a ~#match?~ predicate on the ~item~ capture:
+Use the structural query to select all headlines, then pass a ~patterns~ list
+to the ~query~ tool to restrict by content.  Because all patterns must match
+(AND semantics), the order of keywords is irrelevant:
 
-#+begin_src scheme
-(section
-  headline: (headline
-    item: (item) @title
-    (#match? @title "experiment")))
+#+begin_src json
+{
+  "query": "(section headline: (headline item: (item) @title))",
+  "patterns": ["experiment", "bilayer"]
+}
 #+end_src
+
+This returns only headlines whose text contains both words.  Avoid embedding
+text-matching predicates like ~#match?~ directly in the S-expression query for
+content search — they interact poorly with the tree-sitter query compiler when
+placed on high-level nodes (see the ~expr~ predicate note below).
 
 ** Headlines with a specific tag
 
