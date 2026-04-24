@@ -38,16 +38,13 @@ The server exposes two complementary query interfaces:
   node types and fields.  This surface is appropriate when the predefined set
   does not cover a particular need.
 
-** Verified patching (planned)
+** Verified patching
 
 All edits are expressed as patches against byte ranges derived from the syntax
-tree.  Before any patch is written to disk the server will re-parse the
-would-be result and reject the change if it introduces a syntax error.  The
-round-trip parse acts as a lightweight contract: the file on disk remains
-syntactically valid org.
-
-*Note:* Patch integrity and syntax verification is not yet implemented.
-Current patches are applied without verification.
+tree.  Before any patch is written to disk the server re-parses the
+would-be result and rejects the change if it introduces a syntax error or a
+duplicate ~CUSTOM_ID~.  The round-trip parse acts as a lightweight contract:
+the file on disk always remains syntactically valid org.
 
 ** CUSTOM_ID as section locator
 
@@ -65,7 +62,10 @@ explicitly:
 
 1. *Broad query* — retrieve an outline or section list to orient in the document.
 2. *Focus query* — narrow to a specific subtree, block, or property drawer.
-3. *Patch* — apply a targeted edit to the focused region (integrity verification planned).
+3. *Patch* — apply a targeted edit to the focused region; the result is
+   validated before the file is written.
+4. *Refile* — optionally move a section to a different position in the same
+   file or to another file entirely.
 
 Each stage is independently auditable, which makes the overall workflow both
 debuggable and resumable.
@@ -77,8 +77,10 @@ debuggable and resumable.
 2. *Focus* — select interesting elements from the results.
 3. *Navigate* — use quick-navigation functions like ~open_link~ to follow
   references and explore related sections.
-4. *Patch* — optionally apply targeted edits to focused regions (integrity
-  verification planned).
+4. *Patch* — optionally apply targeted edits to focused regions; validated
+   before writing.
+5. *Refile* — optionally move sections across the document or between files
+   to reorganise the knowledge base.
 
 This pattern supports exploration-driven discovery and cross-document navigation
 before committing to edits.
