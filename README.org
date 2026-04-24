@@ -15,12 +15,14 @@ precise and composable.
 
 * Design Principles
 
-** Structural, not textual
+** Structural with regex complement
 
 Queries operate on the parsed syntax tree rather than raw text.  Headlines,
 sections, blocks, drawers, timestamps, tags, and properties are all
 first-class nodes.  This eliminates an entire class of fragile regex-over-lines
-approaches.
+approaches. Regular expressions (~#match?~, ~#eq?~) complement the structural
+matching to handle parser fragility and real-world edge cases where the syntax
+tree alone is insufficient.
 
 ** Hybrid query API
 
@@ -36,25 +38,50 @@ The server exposes two complementary query interfaces:
   node types and fields.  This surface is appropriate when the predefined set
   does not cover a particular need.
 
-** Verified patching
+** Verified patching (planned)
 
 All edits are expressed as patches against byte ranges derived from the syntax
-tree.  Before any patch is written to disk the server re-parses the would-be
-result and rejects the change if it introduces a syntax error.  The round-trip
-parse acts as a lightweight contract: the file on disk is always
+tree.  Before any patch is written to disk the server will re-parse the
+would-be result and reject the change if it introduces a syntax error.  The
+round-trip parse acts as a lightweight contract: the file on disk remains
 syntactically valid org.
+
+*Note:* Patch integrity and syntax verification is not yet implemented.
+Current patches are applied without verification.
+
+** CUSTOM_ID as section locator
+
+The ~CUSTOM_ID~ property is the elected feature for reliable section location
+prior to editing. Its usage is enforced across the server's APIs to ensure
+that section references remain stable and unambiguous across document
+modifications.
 
 ** Documented multi-stage workflow
 
 Complex editing tasks are decomposed into stages that an agent can follow
 explicitly:
 
+*** Top-down workflow
+
 1. *Broad query* — retrieve an outline or section list to orient in the document.
 2. *Focus query* — narrow to a specific subtree, block, or property drawer.
-3. *Patch* — apply a targeted, verified edit to the focused region.
+3. *Patch* — apply a targeted edit to the focused region (integrity verification planned).
 
 Each stage is independently auditable, which makes the overall workflow both
 debuggable and resumable.
+
+*** Horizontal / bottom-up workflow
+
+1. *Search and collect* — use ~search_dir~ or query across documents to collect
+  matches with breadcrumbs (parent headings, file paths, line numbers).
+2. *Focus* — select interesting elements from the results.
+3. *Navigate* — use quick-navigation functions like ~open_link~ to follow
+  references and explore related sections.
+4. *Patch* — optionally apply targeted edits to focused regions (integrity
+  verification planned).
+
+This pattern supports exploration-driven discovery and cross-document navigation
+before committing to edits.
 
 * Use Cases
 
