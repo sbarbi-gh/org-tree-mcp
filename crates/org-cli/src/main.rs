@@ -4,10 +4,11 @@ use regex::Regex;
 use std::path::Path;
 
 use org_parser::{
-    ensure_custom_id as org_ensure_custom_id, make_parser, outline, parse_org_link,
+    ensure_custom_id as org_ensure_custom_id, insert_subtree as org_insert_subtree,
+    make_parser, outline, parse_org_link,
     patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
     resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, OrgLink, RefileOutput, SectionRef,
+    Dest, EnsureCustomIdResult, InsertOutput, OrgLink, RefileOutput, SectionRef,
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -63,15 +64,40 @@ enum Cmd {
     /// Print documented tree-sitter query examples for the org grammar.
     QueryExamples,
 
-    /// Search and replace text within the subtree identified by a CUSTOM_ID.
+    /// Search and replace text within a subtree (identify by --id, --line, or --heading).
     PatchSubtree {
         file: String,
+        /// :CUSTOM_ID: value (preferred).
         #[arg(long)]
-        id: String,
+        id: Option<String>,
+        /// 0-indexed line number.
+        #[arg(long)]
+        line: Option<usize>,
+        /// Heading path element, one per level (repeatable).
+        #[arg(long = "heading")]
+        heading: Vec<String>,
         #[arg(long)]
         search: String,
         #[arg(long)]
         replace: String,
+    },
+
+    /// Insert org-mode text at the specified destination.
+    Insert {
+        /// Org-mode text to insert verbatim. Adjust heading depth before calling.
+        content: String,
+        /// Placement: before|after|first-child|last-child|doc-top|doc-bottom.
+        #[arg(long)]
+        placement: String,
+        /// Destination file (always required — no source file to fall back to).
+        #[arg(long)]
+        dest_file: String,
+        /// CUSTOM_ID of the destination anchor section.
+        #[arg(long)]
+        dest_id: Option<String>,
+        /// Line number of the destination anchor section (alternative to --dest-id).
+        #[arg(long)]
+        dest_line: Option<usize>,
     },
 
     /// Ensure the section at the given line has a :CUSTOM_ID:, inserting one if absent.
@@ -175,8 +201,23 @@ fn run(cmd: Cmd) -> Result<()> {
             print!("{}", org_parser::QUERY_EXAMPLES);
         }
 
-        Cmd::PatchSubtree { file, id, search, replace } => {
-            let out = run_patch(&file, &id, &search, &replace)?;
+        Cmd::PatchSubtree { file, id, line, heading, search, replace } => {
+            let r = if let Some(id) = id {
+                SectionRef::Id { file: None, id }
+            } else if let Some(n) = line {
+                SectionRef::Line { file: None, line: n }
+            } else if !heading.is_empty() {
+                SectionRef::Path { file: None, path: heading }
+            } else {
+                bail!("provide at least one of --id (preferred), --line, or --heading");
+            };
+            let out = run_patch(&file, &r, &search, &replace)?;
+            println!("{out}");
+        }
+
+        Cmd::Insert { content, placement, dest_file, dest_id, dest_line } => {
+            let dest = build_dest(&placement, Some(dest_file), dest_id, dest_line)?;
+            let out = run_insert(&content, &dest)?;
             println!("{out}");
         }
 
@@ -301,15 +342,14 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> Result<String> {
     }
 }
 
-fn run_patch(file: &str, custom_id: &str, search: &str, replace: &str) -> Result<String> {
+fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> Result<String> {
     let source = std::fs::read(file)
         .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
     let mut parser = make_parser()?;
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let r = SectionRef::Id { file: None, id: custom_id.to_string() };
-    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, &r, search, replace)?;
+    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, r, search, replace)?;
     let report = org_validate(&modified_bytes)?;
     if report.has_errors() {
         bail!(
@@ -414,6 +454,23 @@ fn run_refile(src_ref: &SectionRef, dest: &Dest) -> Result<String> {
             "line": dest_start_line,
         },
         "custom_id_changed": custom_id_changed,
+        "validation": validation,
+    }))?)
+}
+
+fn run_insert(content: &str, dest: &Dest) -> Result<String> {
+    let InsertOutput { dest_file, dest_bytes, dest_start_line, validation } =
+        org_insert_subtree(content, dest)?;
+    if validation.has_errors() {
+        bail!(
+            "write aborted — validation errors: {}",
+            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
+        );
+    }
+    std::fs::write(&dest_file, &dest_bytes)
+        .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "dest": { "file": dest_file, "line": dest_start_line },
         "validation": validation,
     }))?)
 }

@@ -5,8 +5,8 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ByteRange, Dest, Diagnostic, DiagnosticKind, HeadlineEntry, Position, QueryMatch,
-    RefileOutput, SectionInfo, SectionRef, ValidationReport,
+    ByteRange, Dest, Diagnostic, DiagnosticKind, HeadlineEntry, InsertOutput, Position,
+    QueryMatch, RefileOutput, SectionInfo, SectionRef, ValidationReport,
 };
 
 
@@ -807,20 +807,23 @@ fn insertion_offset(
 }
 
 /// Produce modified bytes for a same-file refile (insert + remove in one pass).
+/// Returns `(bytes, content_start_byte)` where `content_start_byte` is the
+/// 0-indexed byte offset of the inserted content in the result buffer.
 fn build_same_file(
     source: &[u8],
     src_start: usize,
     src_end: usize,
     insert_at: usize,
     content: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, usize)> {
     if insert_at > src_start && insert_at <= src_end {
         bail!("circular refile: insertion point is inside the source section");
     }
 
-    let combined = if insert_at <= src_start {
+    if insert_at <= src_start {
         // Insert first (before src), then remove the shifted src range.
         let prefix = blank_line_prefix(source, insert_at);
+        let content_start = insert_at + prefix.len();
         let shift = prefix.len() + content.len();
         let new_src_start = src_start + shift;
         let new_src_end   = src_end   + shift;
@@ -834,7 +837,7 @@ fn build_same_file(
         let mut r = Vec::with_capacity(inter.len() - (src_end - src_start));
         r.extend_from_slice(&inter[..new_src_start]);
         r.extend_from_slice(&inter[new_src_end..]);
-        collapse_blank_lines(r)
+        Ok((collapse_blank_lines(r), content_start))
     } else {
         // insert_at > src_end: remove src first, then insert at adjusted offset.
         let removed = src_end - src_start;
@@ -845,14 +848,14 @@ fn build_same_file(
         inter.extend_from_slice(&source[src_end..]);
 
         let prefix = blank_line_prefix(&inter, new_insert);
+        let content_start = new_insert + prefix.len();
         let mut r = Vec::with_capacity(inter.len() + prefix.len() + content.len());
         r.extend_from_slice(&inter[..new_insert]);
         r.extend_from_slice(prefix.as_bytes());
         r.extend_from_slice(content.as_bytes());
         r.extend_from_slice(&inter[new_insert..]);
-        collapse_blank_lines(r)
-    };
-    Ok(combined)
+        Ok((collapse_blank_lines(r), content_start))
+    }
 }
 
 // ── refile_subtree ────────────────────────────────────────────────────────────
@@ -871,15 +874,7 @@ pub(crate) fn refile_bytes(
     dest: &Dest,
     same_file: bool,
 ) -> Result<RefileOutput> {
-    // ── 1. Require CUSTOM_ID on source ────────────────────────────────────────
-    let src_custom_id = src_info.custom_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "source section {:?} has no :CUSTOM_ID: — call ensure_custom_id first",
-            src_info.title
-        )
-    })?;
-
-    // ── 2. Compute target depth ───────────────────────────────────────────────
+    // ── 1. Compute target depth ───────────────────────────────────────────────
     let new_depth: usize = match dest {
         Dest::DocTop { .. } | Dest::DocBottom { .. } => 1,
         Dest::Before { .. } | Dest::After { .. } => {
@@ -890,7 +885,7 @@ pub(crate) fn refile_bytes(
         }
     };
 
-    // ── 3. Circularity guard (same file only) ─────────────────────────────────
+    // ── 2. Circularity guard (same file only) ─────────────────────────────────
     if same_file {
         if let Some(di) = dest_info {
             if di.range.start > src_info.range.start && di.range.end <= src_info.range.end {
@@ -902,70 +897,69 @@ pub(crate) fn refile_bytes(
         }
     }
 
-    // ── 4. Depth-adjust the extracted subtree ─────────────────────────────────
+    // ── 3. Depth-adjust the extracted subtree ─────────────────────────────────
     let delta = new_depth as i32 - src_info.depth as i32;
     let mut adjusted = adjust_depth(&src_info.subtree, delta)?;
     if !adjusted.ends_with('\n') {
         adjusted.push('\n');
     }
 
-    // ── 5. Disambiguate CUSTOM_ID in dest ────────────────────────────────────
-    let existing_dest_ids = collect_custom_ids(dest_source, dest_tree.root_node())?;
-    // For same-file refiling the src section is removed in the same pass, so
-    // its own ID is not a collision — only count it as taken if another section
-    // already carries the same ID (count > 1).
-    let id_occurrences = existing_dest_ids.iter().filter(|id| id.as_str() == src_custom_id).count();
-    let has_collision = if same_file { id_occurrences > 1 } else { id_occurrences > 0 };
-    let final_custom_id = if has_collision {
-        (2u32..)
-            .find_map(|i| {
-                let c = format!("{src_custom_id}-{i}");
-                if !existing_dest_ids.iter().any(|id| id == &c) { Some(c) } else { None }
-            })
-            .unwrap() // infinite iterator, always terminates
+    // ── 4. Disambiguate CUSTOM_ID in dest (only when source has one) ──────────
+    let (final_custom_id, custom_id_changed) = if let Some(src_id) = src_info.custom_id.as_deref() {
+        let existing_dest_ids = collect_custom_ids(dest_source, dest_tree.root_node())?;
+        // For same-file refiling the src section is removed in the same pass,
+        // so its own ID is not a collision unless another section shares it.
+        let id_occurrences = existing_dest_ids.iter().filter(|id| id.as_str() == src_id).count();
+        let has_collision = if same_file { id_occurrences > 1 } else { id_occurrences > 0 };
+        let final_id = if has_collision {
+            (2u32..)
+                .find_map(|i| {
+                    let c = format!("{src_id}-{i}");
+                    if !existing_dest_ids.iter().any(|id| id == &c) { Some(c) } else { None }
+                })
+                .unwrap()
+        } else {
+            src_id.to_string()
+        };
+        let changed = final_id != src_id;
+        if changed {
+            adjusted = adjusted.replace(
+                &format!(":CUSTOM_ID: {src_id}"),
+                &format!(":CUSTOM_ID: {final_id}"),
+            );
+        }
+        (Some(final_id), changed)
     } else {
-        src_custom_id.to_string()
+        (None, false)
     };
-    let custom_id_changed = final_custom_id != src_custom_id;
 
-    if custom_id_changed {
-        adjusted = adjusted.replace(
-            &format!(":CUSTOM_ID: {src_custom_id}"),
-            &format!(":CUSTOM_ID: {final_custom_id}"),
-        );
-    }
-
-    // ── 6. Compute insertion offset ───────────────────────────────────────────
+    // ── 5. Compute insertion offset ───────────────────────────────────────────
     let insert_at = insertion_offset(dest_source, dest_tree, dest_info, dest)?;
 
-    // ── 7. Build modified byte buffers ────────────────────────────────────────
-    let (src_bytes, dest_bytes) = if same_file {
-        let combined = build_same_file(
+    // ── 6. Build modified byte buffers + dest_start_line ─────────────────────
+    let (src_bytes, dest_bytes, dest_start_line) = if same_file {
+        let (combined, content_start) = build_same_file(
             src_source,
             src_info.range.start,
             src_info.range.end,
             insert_at,
             &adjusted,
         )?;
-        (combined.clone(), combined)
+        let line = combined[..content_start].iter().filter(|&&b| b == b'\n').count();
+        (combined.clone(), combined, line)
     } else {
+        let prefix = blank_line_prefix(dest_source, insert_at);
+        let line = dest_source[..insert_at].iter().filter(|&&b| b == b'\n').count() + prefix.len();
         let d = insert_with_padding(dest_source, insert_at, &adjusted);
         let s = remove_section_bytes(src_source, src_info.range.start, src_info.range.end);
-        (s, d)
+        (s, d, line)
     };
 
-    // ── 8. Re-parse dest to get final line number + validate ──────────────────
+    // ── 7. Re-parse and validate ──────────────────────────────────────────────
     let mut parser = crate::parser::make_parser()?;
     let dest_tree_new = parser
         .parse(&dest_bytes, None)
         .ok_or_else(|| anyhow::anyhow!("re-parse of dest failed after refile"))?;
-
-    let inserted_info = resolve_section_ref(
-        &dest_bytes,
-        &dest_tree_new,
-        &SectionRef::Id { file: None, id: final_custom_id.clone() },
-    )?;
-
     let mut validation = validate_tree(&dest_bytes, &dest_tree_new)?;
 
     if !same_file {
@@ -985,8 +979,76 @@ pub(crate) fn refile_bytes(
         dest_bytes,
         final_custom_id,
         custom_id_changed,
-        dest_start_line: inserted_info.start_line,
+        dest_start_line,
         src_title: src_info.title.clone(),
+        validation,
+    })
+}
+
+// ── insert_subtree ────────────────────────────────────────────────────────────
+
+/// Insert `content` (raw org text) at the position described by `dest`.
+///
+/// The destination file is taken from the `section.file` / `file` field inside
+/// `dest` — it must always be specified (there is no source file to fall back
+/// to).  The caller is responsible for depth-adjusting `content` before
+/// calling this function.  Returns the modified bytes together with the
+/// resolved file path; the caller writes them to disk.
+pub fn insert_subtree(content: &str, dest: &Dest) -> Result<InsertOutput> {
+    let dest_file_path: &str = match dest {
+        Dest::Before     { section }
+        | Dest::After      { section }
+        | Dest::FirstChild { section }
+        | Dest::LastChild  { section } => section
+            .file()
+            .ok_or_else(|| anyhow::anyhow!("dest section.file is required for insert_subtree"))?,
+        Dest::DocTop  { file }
+        | Dest::DocBottom { file } => file
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("dest.file is required for insert_subtree"))?,
+    };
+
+    let dest_source = std::fs::read(dest_file_path)
+        .map_err(|e| anyhow::anyhow!("cannot read {dest_file_path}: {e}"))?;
+    let mut p = crate::parser::make_parser()?;
+    let dest_tree = p
+        .parse(&dest_source, None)
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {dest_file_path}"))?;
+
+    let dest_section_ref: Option<&SectionRef> = match dest {
+        Dest::Before     { section }
+        | Dest::After      { section }
+        | Dest::FirstChild { section }
+        | Dest::LastChild  { section } => Some(section),
+        Dest::DocTop { .. } | Dest::DocBottom { .. } => None,
+    };
+    let dest_info = dest_section_ref
+        .map(|r| resolve_section_ref(&dest_source, &dest_tree, r))
+        .transpose()?;
+
+    let insert_at = insertion_offset(&dest_source, &dest_tree, dest_info.as_ref(), dest)?;
+
+    let mut content_normalized = content.to_string();
+    if !content_normalized.ends_with('\n') {
+        content_normalized.push('\n');
+    }
+
+    let prefix = blank_line_prefix(&dest_source, insert_at);
+    let dest_start_line =
+        dest_source[..insert_at].iter().filter(|&&b| b == b'\n').count() + prefix.len();
+
+    let dest_bytes = insert_with_padding(&dest_source, insert_at, &content_normalized);
+
+    let mut parser = crate::parser::make_parser()?;
+    let dest_tree_new = parser
+        .parse(&dest_bytes, None)
+        .ok_or_else(|| anyhow::anyhow!("re-parse of dest failed after insert"))?;
+    let validation = validate_tree(&dest_bytes, &dest_tree_new)?;
+
+    Ok(InsertOutput {
+        dest_file: dest_file_path.to_string(),
+        dest_bytes,
+        dest_start_line,
         validation,
     })
 }
@@ -1334,7 +1396,7 @@ Content.
         let out = refile_bytes(src, "", &src_info, dest, "", &dt, Some(&dest_info), &Dest::After { section: SectionRef::Id { file: None, id: String::new() } }, false).unwrap();
 
         assert!(out.validation.errors.is_empty());
-        assert_eq!(out.final_custom_id, "alpha");
+        assert_eq!(out.final_custom_id, Some("alpha".to_string()));
         assert!(!out.custom_id_changed);
 
         let dest_str = std::str::from_utf8(&out.dest_bytes).unwrap();
@@ -1361,7 +1423,7 @@ Content.
         let out = refile_bytes(src, "", &src_info, dest, "", &dt, None, &Dest::DocBottom { file: None }, false).unwrap();
 
         assert!(out.custom_id_changed);
-        assert_eq!(out.final_custom_id, "alpha-2");
+        assert_eq!(out.final_custom_id, Some("alpha-2".to_string()));
         let dest_str = std::str::from_utf8(&out.dest_bytes).unwrap();
         assert!(dest_str.contains(":CUSTOM_ID: alpha-2"));
     }
@@ -1429,7 +1491,7 @@ Content.
         let dest_info = resolve(src, &tree, "beta-sub");
         let out = refile_bytes(src, "", &src_info, src, "", &tree, Some(&dest_info),
             &Dest::Before { section: SectionRef::Id { file: None, id: String::new() } }, true).unwrap();
-        assert_eq!(out.final_custom_id, "alpha");
+        assert_eq!(out.final_custom_id, Some("alpha".to_string()));
         assert!(!out.custom_id_changed);
     }
 

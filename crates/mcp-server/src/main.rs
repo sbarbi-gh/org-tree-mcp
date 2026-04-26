@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use org_parser::{
-    ensure_custom_id as org_ensure_custom_id, make_parser, outline, parse_org_link,
+    ensure_custom_id as org_ensure_custom_id, insert_subtree as org_insert_subtree,
+    make_parser, outline, parse_org_link,
     patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
     resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, OrgLink, QueryMatch, RefileOutput, SectionInfo,
+    Dest, EnsureCustomIdResult, InsertOutput, OrgLink, QueryMatch, RefileOutput, SectionInfo,
     SectionRef,
 };
 
@@ -54,12 +55,31 @@ struct SubtreeParams {
 struct PatchSubtreeParams {
     /// Absolute path to the org file.
     file: String,
-    /// Value of the :CUSTOM_ID: property identifying the target section.
-    custom_id: String,
+    /// Value of the :CUSTOM_ID: property of the target section (preferred — use
+    /// this whenever the section has one).
+    custom_id: Option<String>,
+    /// 0-indexed row (start_position.row from outline / query results).
+    /// Used when custom_id is absent.
+    line: Option<usize>,
+    /// Heading path from root to target section; each element is a
+    /// case-insensitive regex. Used when both custom_id and line are absent.
+    heading_path: Option<Vec<String>>,
     /// Literal string to search for within the section (all occurrences are replaced).
     search: String,
     /// Replacement string.
     replace: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct InsertSubtreeParams {
+    /// Org-mode text to insert verbatim. The caller is responsible for
+    /// adjusting heading depth to match the target nesting level.
+    content: String,
+    /// Destination placement. `dest.section.file` (or `dest.file` for
+    /// doc_top / doc_bottom) must be an absolute path — there is no source
+    /// file to fall back to.
+    #[serde(deserialize_with = "from_str_or_obj")]
+    dest: Dest,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -247,11 +267,21 @@ impl OrgMcpServer {
     }
 
     /// Apply a literal search-and-replace within the subtree identified by
-    /// `custom_id`. All occurrences of `search` are replaced with `replace`.
-    /// The file is updated in-place. Returns the modified subtree text.
-    #[tool(description = "Search and replace text within the subtree identified by a CUSTOM_ID, writing the result back to the file.")]
+    /// `custom_id` (preferred), `line`, or `heading_path`. All occurrences of
+    /// `search` are replaced with `replace`. The file is updated in-place.
+    /// Returns the modified subtree text.
+    #[tool(description = "Search and replace text within a subtree identified by custom_id (preferred), line, or heading_path, writing the result back to the file.")]
     async fn patch_subtree(&self, Parameters(p): Parameters<PatchSubtreeParams>) -> String {
-        match run_patch(&p.file, &p.custom_id, &p.search, &p.replace) {
+        let r = if let Some(id) = p.custom_id {
+            SectionRef::Id { file: None, id }
+        } else if let Some(n) = p.line {
+            SectionRef::Line { file: None, line: n }
+        } else if let Some(path) = p.heading_path {
+            SectionRef::Path { file: None, path }
+        } else {
+            return error_json("provide at least one of custom_id (preferred), line, or heading_path");
+        };
+        match run_patch(&p.file, &r, &p.search, &p.replace) {
             Ok(s) => s,
             Err(e) => error_json(&e.to_string()),
         }
@@ -270,27 +300,40 @@ impl OrgMcpServer {
         }
     }
 
-    /// Move a section (identified by its CUSTOM_ID in the source file) to a new
-    /// location in the same or a different org file.  The source section is
-    /// deleted from `src.file`; the depth-adjusted subtree is inserted at the
-    /// position described by `dest`.  Both files are written atomically only
-    /// after validation succeeds.
+    /// Move a section to a new location in the same or a different org file.
+    /// The source section is identified by `src` (CUSTOM_ID preferred; also
+    /// accepts line or heading_path).  The source section is deleted from
+    /// `src.file`; the depth-adjusted subtree is inserted at the position
+    /// described by `dest`.  Both files are written only after validation
+    /// succeeds.
     ///
-    /// `dest.placement` is the discriminant that controls all other `dest` fields:
-    ///   - `before` / `after`       — sibling of a section; requires `dest.custom_id`
-    ///   - `child_first` / `child_last` — child of a section; requires `dest.custom_id`
-    ///   - `doc_first` / `doc_last` — top-level in the file; no `dest.custom_id`
+    /// `dest.placement` controls all other `dest` fields:
+    ///   - `before` / `after`       — sibling of a section anchor
+    ///   - `first_child` / `last_child` — child of a section anchor
+    ///   - `doc_top` / `doc_bottom` — top-level position in the file
     ///
-    /// If the section's CUSTOM_ID already exists in the destination file it is
-    /// automatically disambiguated (suffix `-2`, `-3`, …).  The destination file
-    /// must already exist; create it before calling this tool if needed.
+    /// If the section has a CUSTOM_ID that already exists in the destination
+    /// it is automatically disambiguated (suffix `-2`, `-3`, …).
     ///
-    /// Returns `{ src: {file, custom_id, title}, dest: {file, custom_id, line},
+    /// Returns `{ src: {file, title}, dest: {file, custom_id, line},
     ///   custom_id_changed, validation: {errors, warnings} }`.
-    /// Use the returned `dest` to compose a link at the original location.
-    #[tool(description = "Move a section (by CUSTOM_ID) within or between org files, adjusting heading depth and disambiguating CUSTOM_ID collisions automatically.")]
+    #[tool(description = "Move a section (by CUSTOM_ID, line, or heading_path — CUSTOM_ID preferred) within or between org files, adjusting heading depth and disambiguating CUSTOM_ID collisions automatically.")]
     async fn refile_subtree(&self, Parameters(p): Parameters<RefileSubtreeParams>) -> String {
         match run_refile(&p.src, &p.dest) {
+            Ok(s) => s,
+            Err(e) => error_json(&e.to_string()),
+        }
+    }
+
+    /// Insert raw org-mode text at the destination described by `dest`.
+    /// The placement semantics are identical to `refile_subtree`.
+    /// `dest.section.file` (or `dest.file` for doc_top / doc_bottom) must
+    /// always be an absolute path.  The caller is responsible for
+    /// depth-adjusting `content` before calling this tool.
+    /// Returns `{ dest: {file, line}, validation: {errors, warnings} }`.
+    #[tool(description = "Insert org-mode text at a destination (same placement semantics as refile_subtree). dest.section.file must be set. Caller adjusts heading depth. Returns {dest: {file, line}, validation}.")]
+    async fn insert_subtree(&self, Parameters(p): Parameters<InsertSubtreeParams>) -> String {
+        match run_insert(&p.content, &p.dest) {
             Ok(s) => s,
             Err(e) => error_json(&e.to_string()),
         }
@@ -318,16 +361,19 @@ in org section drawers. Use `subtree` to retrieve a section's full metadata and 
 any combination of heading_path, custom_id, or line (0-indexed row from \
 outline/query start_position.row) as AND-ed criteria — supply line alongside \
 heading_path to resolve duplicate titles. Use `patch_subtree` to apply a \
-literal search-and-replace within a section identified by CUSTOM_ID, writing \
-the result back to the file. Use `ensure_custom_id` to add a :CUSTOM_ID: to \
-a section identified by 0-indexed line, with automatic disambiguation if the \
-proposed ID is already taken. Use `refile_subtree` to move a section \
-(identified by CUSTOM_ID) within or across org files: the section is removed \
-from src, depth-adjusted to fit the destination nesting level, and inserted \
-according to `dest.placement` (before/after a sibling, child_first/child_last \
-inside a section, or doc_first/doc_last at the file root). CUSTOM_ID \
-collisions in the destination are auto-disambiguated; the final CUSTOM_ID and \
-line number are returned so you can insert a link at the original location."
+literal search-and-replace within a section identified by custom_id (preferred), \
+line, or heading_path, writing the result back to the file. Use `ensure_custom_id` \
+to add a :CUSTOM_ID: to a section identified by 0-indexed line, with automatic \
+disambiguation if the proposed ID is already taken. Use `refile_subtree` to move \
+a section (identified by custom_id, line, or heading_path — custom_id strongly \
+preferred) within or across org files: the section is removed from src, \
+depth-adjusted to fit the destination nesting level, and inserted according to \
+`dest.placement` (before/after a sibling, first_child/last_child inside a section, \
+or doc_top/doc_bottom at the file root). CUSTOM_ID collisions in the destination \
+are auto-disambiguated; the destination line number is returned. Use \
+`insert_subtree` to insert raw org text at a destination (same placement \
+semantics as refile_subtree, but no source section is removed); the caller \
+supplies depth-adjusted content and dest.section.file or dest.file."
 )]
 impl ServerHandler for OrgMcpServer {}
 
@@ -433,15 +479,14 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String
     }
 }
 
-fn run_patch(file: &str, custom_id: &str, search: &str, replace: &str) -> anyhow::Result<String> {
+fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> anyhow::Result<String> {
     let source = std::fs::read(file)
         .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
     let mut parser = make_parser()?;
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let r = SectionRef::Id { file: None, id: custom_id.to_string() };
-    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, &r, search, replace)?;
+    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, r, search, replace)?;
     let report = org_validate(&modified_bytes)?;
     if report.has_errors() {
         anyhow::bail!(
@@ -521,6 +566,23 @@ fn run_refile(src_ref: &SectionRef, dest: &Dest) -> anyhow::Result<String> {
             "line": dest_start_line,
         },
         "custom_id_changed": custom_id_changed,
+        "validation": validation,
+    }))?)
+}
+
+fn run_insert(content: &str, dest: &Dest) -> anyhow::Result<String> {
+    let InsertOutput { dest_file, dest_bytes, dest_start_line, validation } =
+        org_insert_subtree(content, dest)?;
+    if validation.has_errors() {
+        anyhow::bail!(
+            "write aborted — validation errors: {}",
+            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
+        );
+    }
+    std::fs::write(&dest_file, &dest_bytes)
+        .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "dest": { "file": dest_file, "line": dest_start_line },
         "validation": validation,
     }))?)
 }

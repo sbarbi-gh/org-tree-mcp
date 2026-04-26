@@ -118,8 +118,8 @@ pub struct RefileOutput {
     pub src_bytes: Vec<u8>,
     /// Modified destination file (section inserted with padding).
     pub dest_bytes: Vec<u8>,
-    /// The CUSTOM_ID the section carries in its new location.
-    pub final_custom_id: String,
+    /// The CUSTOM_ID the section carries in its new location, if it had one.
+    pub final_custom_id: Option<String>,
     /// True when `final_custom_id` differs from the original because of a
     /// collision with an existing ID in the destination file.
     pub custom_id_changed: bool,
@@ -128,6 +128,20 @@ pub struct RefileOutput {
     /// Title of the moved section (for link construction by the caller).
     pub src_title: String,
     /// Validation report for the modified files.
+    pub validation: ValidationReport,
+}
+
+/// Output of [`crate::insert_subtree`]. The caller is responsible for writing
+/// `dest_bytes` to the path given by `dest_file`.
+#[derive(Debug)]
+pub struct InsertOutput {
+    /// Resolved absolute path of the destination file.
+    pub dest_file: String,
+    /// Modified destination file (content inserted with padding).
+    pub dest_bytes: Vec<u8>,
+    /// 0-indexed headline row of the inserted content in the destination file.
+    pub dest_start_line: usize,
+    /// Validation report for the modified file.
     pub validation: ValidationReport,
 }
 
