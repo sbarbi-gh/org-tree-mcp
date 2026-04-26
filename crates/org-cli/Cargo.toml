@@ -1,0 +1,17 @@
+[package]
+name = "org-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "org"
+path = "src/main.rs"
+
+[dependencies]
+org-parser = { path = "../org-parser" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+clap = { workspace = true }
+tree-sitter = { workspace = true }

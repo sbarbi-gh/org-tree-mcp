@@ -3,6 +3,7 @@ members = [
     "grammar/tree-sitter-org",
     "crates/org-parser",
     "crates/mcp-server",
+    "crates/org-cli",
 ]
 resolver = "2"
 
@@ -17,3 +18,4 @@ rmcp = { version = "1", features = ["server", "transport-io"] }
 streaming-iterator = "0.1"
 regex = "1"
 schemars = "1"
+clap = { version = "4", features = ["derive"] }

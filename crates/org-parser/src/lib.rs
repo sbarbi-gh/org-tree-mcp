@@ -11,3 +11,5 @@ pub use types::{
     ByteRange, Dest, Diagnostic, DiagnosticKind, HeadlineEntry, Position, QueryMatch,
     RefileOutput, SectionInfo, SectionRef, ValidationReport,
 };
+
+pub const QUERY_EXAMPLES: &str = include_str!("query_examples.md");
