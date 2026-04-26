@@ -57,10 +57,12 @@ the file on disk always remains syntactically valid org.
 
 ** CUSTOM_ID as section locator
 
-The ~CUSTOM_ID~ property is the elected feature for reliable section location
-prior to editing. Its usage is enforced across the server's APIs to ensure
-that section references remain stable and unambiguous across document
-modifications.
+The ~CUSTOM_ID~ property is the preferred feature for reliable section location
+prior to editing.  All editing tools (~patch_subtree~, ~refile_subtree~,
+~insert_subtree~) also accept ~line~ or ~heading_path~ as fallbacks, but
+CUSTOM_ID is strongly recommended: it remains stable across document
+modifications and is never ambiguous.  Use ~ensure_custom_id~ to assign a
+stable ID to any section that lacks one.
 
 ** Documented multi-stage workflow
 
@@ -73,8 +75,9 @@ explicitly:
 2. *Focus query* — narrow to a specific subtree, block, or property drawer.
 3. *Patch* — apply a targeted edit to the focused region; the result is
    validated before the file is written.
-4. *Refile* — optionally move a section to a different position in the same
-   file or to another file entirely.
+4. *Insert or refile* — optionally insert new org text at a target position
+   with ~insert_subtree~, or move an existing section within or across files
+   with ~refile_subtree~.
 
 Each stage is independently auditable, which makes the overall workflow both
 debuggable and resumable.
@@ -88,8 +91,9 @@ debuggable and resumable.
   references and explore related sections.
 4. *Patch* — optionally apply targeted edits to focused regions; validated
    before writing.
-5. *Refile* — optionally move sections across the document or between files
-   to reorganise the knowledge base.
+5. *Insert or refile* — optionally insert new content at a target position
+   with ~insert_subtree~, or move existing sections across the document or
+   between files with ~refile_subtree~.
 
 This pattern supports exploration-driven discovery and cross-document navigation
 before committing to edits.
