@@ -19,3 +19,4 @@ streaming-iterator = "0.1"
 regex = "1"
 schemars = "1"
 clap = { version = "4", features = ["derive"] }
+imara-diff = { version = "0.1", features = ["unified_diff"] }

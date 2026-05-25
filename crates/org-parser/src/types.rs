@@ -217,3 +217,31 @@ pub struct HeadlineEntry {
     pub range: ByteRange,
     pub start_position: Position,
 }
+
+/// A unified diff patch representing changes to a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePatch {
+    /// Absolute path to the file that was modified.
+    pub file: String,
+    /// Unified diff string in standard format.
+    pub diff: String,
+}
+
+impl FilePatch {
+    /// Create a new FilePatch from old and new content using imara-diff.
+    pub fn new(file: impl Into<String>, old_content: &[u8], new_content: &[u8]) -> Self {
+        use imara_diff::intern::InternedInput;
+        use imara_diff::{diff, Algorithm, UnifiedDiffBuilder};
+
+        let file_path = file.into();
+        let old_str = std::str::from_utf8(old_content).unwrap_or("");
+        let new_str = std::str::from_utf8(new_content).unwrap_or("");
+
+        let input = InternedInput::new(old_str, new_str);
+        let diff_string = diff(Algorithm::Histogram, &input, UnifiedDiffBuilder::new(&input));
+
+        // Add unified diff headers
+        let diff_with_headers = format!("--- {}\n+++ {}\n{}", file_path, file_path, diff_string);
+        Self { file: file_path, diff: diff_with_headers }
+    }
+}

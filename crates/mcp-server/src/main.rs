@@ -11,7 +11,7 @@ use org_parser::{
     make_parser, outline, parse_org_link,
     patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
     resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, InsertOutput, OrgLink, QueryMatch, RefileOutput, SectionInfo,
+    Dest, EnsureCustomIdResult, FilePatch, InsertOutput, OrgLink, QueryMatch, RefileOutput, SectionInfo,
     SectionRef,
 };
 
@@ -269,8 +269,8 @@ impl OrgMcpServer {
     /// Apply a literal search-and-replace within the subtree identified by
     /// `custom_id` (preferred), `line`, or `heading_path`. All occurrences of
     /// `search` are replaced with `replace`. The file is updated in-place.
-    /// Returns the modified subtree text.
-    #[tool(description = "Search and replace text within a subtree identified by custom_id (preferred), line, or heading_path, writing the result back to the file.")]
+    /// Returns the modified subtree text and a unified diff patch.
+    #[tool(description = "Search and replace text within a subtree identified by custom_id (preferred), line, or heading_path, writing the result back to the file. Returns {subtree, patch} where patch is a unified diff.")]
     async fn patch_subtree(&self, Parameters(p): Parameters<PatchSubtreeParams>) -> String {
         let r = if let Some(id) = p.custom_id {
             SectionRef::Id { file: None, id }
@@ -282,7 +282,12 @@ impl OrgMcpServer {
             return error_json("provide at least one of custom_id (preferred), line, or heading_path");
         };
         match run_patch(&p.file, &r, &p.search, &p.replace) {
-            Ok(s) => s,
+            Ok((subtree, patch)) => {
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "subtree": subtree,
+                    "patch": patch,
+                })).unwrap_or_else(|_| error_json("failed to serialize response"))
+            }
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -479,14 +484,14 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String
     }
 }
 
-fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> anyhow::Result<String> {
+fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> anyhow::Result<(String, FilePatch)> {
     let source = std::fs::read(file)
         .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
     let mut parser = make_parser()?;
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, r, search, replace)?;
+    let (modified_bytes, new_section, patch) = org_patch_subtree(file, &source, &tree, r, search, replace)?;
     let report = org_validate(&modified_bytes)?;
     if report.has_errors() {
         anyhow::bail!(
@@ -496,7 +501,7 @@ fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> anyhow:
     }
     std::fs::write(file, &modified_bytes)
         .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    Ok(new_section)
+    Ok((new_section, patch))
 }
 
 fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::Result<String> {

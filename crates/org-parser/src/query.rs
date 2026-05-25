@@ -5,7 +5,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 use crate::types::{
-    ByteRange, Dest, Diagnostic, DiagnosticKind, HeadlineEntry, InsertOutput, Position,
+    ByteRange, Dest, Diagnostic, DiagnosticKind, FilePatch, HeadlineEntry, InsertOutput, Position,
     QueryMatch, RefileOutput, SectionInfo, SectionRef, ValidationReport,
 };
 
@@ -404,14 +404,15 @@ pub fn section_for(source: &[u8], tree: &Tree, r: &SectionRef) -> Result<Option<
 // ── patch_subtree ─────────────────────────────────────────────────────────────
 
 /// Apply a literal search-and-replace within the subtree identified by `r`.
-/// Returns `(modified_file_bytes, new_section_text)`.
+/// Returns the modified file bytes, the new section text, and a unified diff patch.
 pub fn patch_subtree(
+    file: &str,
     source: &[u8],
     tree: &Tree,
     r: &SectionRef,
     search: &str,
     replace: &str,
-) -> Result<(Vec<u8>, String)> {
+) -> Result<(Vec<u8>, String, FilePatch)> {
     let info = resolve_section_ref(source, tree, r)?;
 
     if !info.subtree.contains(search) {
@@ -426,7 +427,9 @@ pub fn patch_subtree(
     modified.extend_from_slice(new_section.as_bytes());
     modified.extend_from_slice(&source[info.range.end..]);
 
-    Ok((modified, new_section))
+    let patch = FilePatch::new(file, source, &modified);
+
+    Ok((modified, new_section, patch))
 }
 
 // ── nodes_at_line / ensure_custom_id ─────────────────────────────────────────
@@ -1194,8 +1197,8 @@ Sub-section content.
     fn patch_replaces_text_in_section() {
         let src = ORG.as_bytes();
         let tree = parse(src);
-        let (new_bytes, new_text) = patch_subtree(
-            src, &tree,
+        let (new_bytes, new_text, _patch) = patch_subtree(
+            "test.org", src, &tree,
             &SectionRef::Id { file: None, id: "alpha".to_string() },
             "Content of alpha", "Updated content",
         ).unwrap();
@@ -1210,7 +1213,7 @@ Sub-section content.
     fn patch_errors_on_missing_id() {
         let src = ORG.as_bytes();
         let tree = parse(src);
-        let err = patch_subtree(src, &tree, &SectionRef::Id { file: None, id: "nonexistent".to_string() }, "x", "y").unwrap_err();
+        let err = patch_subtree("test.org", src, &tree, &SectionRef::Id { file: None, id: "nonexistent".to_string() }, "x", "y").unwrap_err();
         assert!(err.to_string().contains("CUSTOM_ID"));
     }
 
@@ -1218,7 +1221,7 @@ Sub-section content.
     fn patch_errors_when_search_not_found() {
         let src = ORG.as_bytes();
         let tree = parse(src);
-        let err = patch_subtree(src, &tree, &SectionRef::Id { file: None, id: "alpha".to_string() }, "no such text", "y").unwrap_err();
+        let err = patch_subtree("test.org", src, &tree, &SectionRef::Id { file: None, id: "alpha".to_string() }, "no such text", "y").unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 

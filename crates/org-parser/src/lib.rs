@@ -8,7 +8,7 @@ pub use query::{
     resolve_section_ref, run_query, section_for, validate, EnsureCustomIdResult, OrgLink,
 };
 pub use types::{
-    ByteRange, Dest, Diagnostic, DiagnosticKind, HeadlineEntry, InsertOutput, Position,
+    ByteRange, Dest, Diagnostic, DiagnosticKind, FilePatch, HeadlineEntry, InsertOutput, Position,
     QueryMatch, RefileOutput, SectionInfo, SectionRef, ValidationReport,
 };
 

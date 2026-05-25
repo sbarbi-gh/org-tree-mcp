@@ -8,7 +8,7 @@ use org_parser::{
     make_parser, outline, parse_org_link,
     patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
     resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, InsertOutput, OrgLink, RefileOutput, SectionRef,
+    Dest, EnsureCustomIdResult, FilePatch, InsertOutput, OrgLink, RefileOutput, SectionRef,
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -211,8 +211,11 @@ fn run(cmd: Cmd) -> Result<()> {
             } else {
                 bail!("provide at least one of --id (preferred), --line, or --heading");
             };
-            let out = run_patch(&file, &r, &search, &replace)?;
-            println!("{out}");
+            let (subtree, patch) = run_patch(&file, &r, &search, &replace)?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "subtree": subtree,
+                "patch": patch,
+            }))?);
         }
 
         Cmd::Insert { content, placement, dest_file, dest_id, dest_line } => {
@@ -342,14 +345,14 @@ fn follow_org_link(link: &str, base_file: Option<&str>) -> Result<String> {
     }
 }
 
-fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> Result<String> {
+fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> Result<(String, FilePatch)> {
     let source = std::fs::read(file)
         .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
     let mut parser = make_parser()?;
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let (modified_bytes, new_section) = org_patch_subtree(&source, &tree, r, search, replace)?;
+    let (modified_bytes, new_section, patch) = org_patch_subtree(file, &source, &tree, r, search, replace)?;
     let report = org_validate(&modified_bytes)?;
     if report.has_errors() {
         bail!(
@@ -359,7 +362,7 @@ fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> Result<
     }
     std::fs::write(file, &modified_bytes)
         .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    Ok(new_section)
+    Ok((new_section, patch))
 }
 
 fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> Result<String> {
