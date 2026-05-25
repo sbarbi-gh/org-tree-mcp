@@ -376,6 +376,8 @@ pub fn section_for(source: &[u8], tree: &Tree, r: &SectionRef) -> Result<Option<
                 Some(n) => *n,
                 None => return Ok(None),
             };
+            // Collect non-ancestor hits (true ambiguities)
+            let mut ambiguities: Vec<Node> = Vec::new();
             for hit in &hits {
                 if hit.id() == innermost.id() {
                     continue;
@@ -389,12 +391,26 @@ pub fn section_for(source: &[u8], tree: &Tree, r: &SectionRef) -> Result<Option<
                     }
                 };
                 if !is_ancestor {
-                    bail!(
-                        "ambiguous: {} sections matched path {:?}; use `line` to disambiguate",
-                        hits.len(),
-                        path
-                    );
+                    ambiguities.push(*hit);
                 }
+            }
+            if !ambiguities.is_empty() {
+                let conflicting: Vec<String> = ambiguities
+                    .iter()
+                    .map(|n| {
+                        let line = n.start_position().row;
+                        let cid = section_custom_id(*n, source)
+                            .map(|c| format!(" {:?}", c))
+                            .unwrap_or_default();
+                        format!("line {}{}", line, cid)
+                    })
+                    .collect();
+                bail!(
+                    "ambiguous: {} sections matched path {:?}: {}; use `line` to disambiguate",
+                    hits.len(),
+                    path,
+                    conflicting.join(", ")
+                );
             }
             node_to_section_info(source, innermost).map(Some)
         }
