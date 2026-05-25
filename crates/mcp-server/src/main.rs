@@ -296,7 +296,7 @@ impl OrgMcpServer {
     /// property. If one already exists it is returned unchanged. Otherwise
     /// `custom_id` is checked for uniqueness across the file; a `-2`, `-3`, …
     /// suffix is appended if needed. The file is updated in-place when a new ID
-    /// is inserted. Returns JSON with `custom_id`, `already_existed`, `subtree`.
+    /// is inserted. Returns JSON with `custom_id`, `already_existed`, `patch`.
     #[tool(description = "Ensure the section at the given 0-indexed line has a :CUSTOM_ID:, inserting one (with automatic disambiguation) if absent.")]
     async fn ensure_custom_id(&self, Parameters(p): Parameters<EnsureCustomIdParams>) -> String {
         match run_ensure_custom_id(&p.file, p.line, &p.custom_id) {
