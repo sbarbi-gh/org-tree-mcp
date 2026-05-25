@@ -512,7 +512,7 @@ fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::R
         .parse(&source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
     let r = SectionRef::Line { file: None, line };
-    let EnsureCustomIdResult { custom_id, subtree, file_content, already_existed } =
+    let EnsureCustomIdResult { custom_id, file_content, patch, already_existed } =
         org_ensure_custom_id(&source, &tree, &r, proposed_id)?;
     if !already_existed {
         let report = org_validate(&file_content)?;
@@ -528,7 +528,7 @@ fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::R
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "custom_id": custom_id,
         "already_existed": already_existed,
-        "subtree": subtree,
+        "patch": patch,
     }))?)
 }
 

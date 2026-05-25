@@ -510,16 +510,16 @@ fn insert_custom_id_into_section(source: &[u8], section: Node, id: &str) -> Resu
 
 pub struct EnsureCustomIdResult {
     pub custom_id: String,
-    pub subtree: String,
     pub file_content: Vec<u8>,
+    pub patch: Option<FilePatch>,
     pub already_existed: bool,
 }
 
 /// Ensure the section identified by `r` has a `:CUSTOM_ID:` property.
 /// If one already exists it is returned unchanged. Otherwise `proposed_id` is
 /// checked for uniqueness across the file; a `-2`, `-3`, … suffix is appended
-/// if needed. Returns the assigned ID, the updated subtree text, the full
-/// modified file bytes, and whether the ID pre-existed.
+/// if needed. Returns the assigned ID, the full modified file bytes, a unified
+/// diff patch (None if already existed), and whether the ID pre-existed.
 pub fn ensure_custom_id(
     source: &[u8],
     tree: &Tree,
@@ -533,8 +533,8 @@ pub fn ensure_custom_id(
     if let Some(existing_id) = &info.custom_id {
         return Ok(EnsureCustomIdResult {
             custom_id: existing_id.clone(),
-            subtree: info.subtree,
             file_content: source.to_vec(),
+            patch: None,
             already_existed: true,
         });
     }
@@ -558,18 +558,20 @@ pub fn ensure_custom_id(
 
     let file_content = insert_custom_id_into_section(source, section, &final_id)?;
 
+    let patch = FilePatch::new("", source, &file_content);
+
     let mut parser = crate::parser::make_parser()?;
     let new_tree = parser
         .parse(&file_content, None)
         .ok_or_else(|| anyhow::anyhow!("failed to re-parse after CUSTOM_ID insertion"))?;
-    let subtree = resolve_section_ref(
+    let _subtree = resolve_section_ref(
         &file_content, &new_tree, &SectionRef::Id { file: None, id: final_id.clone() },
     )?.subtree;
 
     Ok(EnsureCustomIdResult {
         custom_id: final_id,
-        subtree,
         file_content,
+        patch: Some(patch),
         already_existed: false,
     })
 }
@@ -1335,7 +1337,8 @@ Content B.
         let res = ensure_custom_id(src, &tree, &SectionRef::Line { file: None, line: 7 }, "beta").unwrap();
         assert!(!res.already_existed);
         assert_eq!(res.custom_id, "beta");
-        assert!(res.subtree.contains(":CUSTOM_ID: beta"));
+        assert!(std::str::from_utf8(&res.file_content).unwrap().contains(":CUSTOM_ID: beta"));
+        assert!(res.patch.is_some());
     }
 
     #[test]
@@ -1346,6 +1349,7 @@ Content B.
         let res = ensure_custom_id(src, &tree, &SectionRef::Line { file: None, line: 6 }, "alpha").unwrap();
         assert!(!res.already_existed);
         assert_eq!(res.custom_id, "alpha-2");
+        assert!(res.patch.is_some());
     }
 
     // ── validate ──────────────────────────────────────────────────────────────
