@@ -395,7 +395,10 @@ pub fn section_for(source: &[u8], tree: &Tree, r: &SectionRef) -> Result<Option<
                 }
             }
             if !ambiguities.is_empty() {
-                let conflicting: Vec<String> = ambiguities
+                // Include innermost in the error message
+                let mut all_conflicting: Vec<Node> = vec![innermost];
+                all_conflicting.extend(ambiguities);
+                let conflicting: Vec<String> = all_conflicting
                     .iter()
                     .map(|n| {
                         let line = n.start_position().row;
@@ -1315,7 +1318,10 @@ Content B.
         let tree = parse(src);
         let path = vec!["Results".to_string()];
         let err = section_for(src, &tree, &SectionRef::Path { file: None, path }).unwrap_err();
-        assert!(err.to_string().contains("ambiguous"));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("ambiguous"));
+        assert!(err_msg.contains("line 0"));
+        assert!(err_msg.contains("line 3"));
     }
 
     #[test]
