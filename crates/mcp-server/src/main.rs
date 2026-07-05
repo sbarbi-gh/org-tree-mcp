@@ -1,19 +1,11 @@
 use anyhow::Result;
-use regex::Regex;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use rmcp::handler::server::wrapper::Parameters;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
-use org_parser::{
-    ensure_custom_id as org_ensure_custom_id, insert_subtree as org_insert_subtree,
-    make_parser, outline, parse_org_link,
-    patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
-    resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, FilePatch, InsertOutput, OrgLink, QueryMatch, RefileOutput, SectionInfo,
-    SectionRef,
-};
+use org_parser::ops;
+use org_parser::{Dest, SectionRef};
 
 // ── parameter types ───────────────────────────────────────────────────────────
 
@@ -68,6 +60,9 @@ struct PatchSubtreeParams {
     search: String,
     /// Replacement string.
     replace: String,
+    /// Bypass the Emacs lockfile guardrail (a `.#filename` lock symlink next
+    /// to the file blocks writes unless this is set).
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -80,6 +75,9 @@ struct InsertSubtreeParams {
     /// file to fall back to.
     #[serde(deserialize_with = "from_str_or_obj")]
     dest: Dest,
+    /// Bypass the Emacs lockfile guardrail (a `.#filename` lock symlink next
+    /// to the destination file blocks writes unless this is set).
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -93,6 +91,9 @@ struct EnsureCustomIdParams {
     /// Proposed :CUSTOM_ID: value. A numeric suffix (-2, -3, …) is appended
     /// automatically if the ID already exists elsewhere in the file.
     custom_id: String,
+    /// Bypass the Emacs lockfile guardrail (a `.#filename` lock symlink next
+    /// to the file blocks writes unless this is set).
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -132,31 +133,9 @@ struct RefileSubtreeParams {
     /// Destination placement.
     #[serde(deserialize_with = "from_str_or_obj")]
     dest: Dest,
-}
-
-// ── per-file match with path ──────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct FileMatch {
-    file: String,
-    #[serde(flatten)]
-    m: QueryMatch,
-}
-
-/// Result of following a section-targeted org link: SectionInfo fields plus
-/// the resolved absolute file path.
-#[derive(Debug, Serialize)]
-struct LinkedSection {
-    file: String,
-    #[serde(flatten)]
-    info: SectionInfo,
-}
-
-/// Result of following a bare file link (no section target).
-#[derive(Debug, Serialize)]
-struct LinkedFile {
-    file: String,
-    content: String,
+    /// Bypass the Emacs lockfile guardrail (a `.#filename` lock symlink next
+    /// to the source and/or destination file blocks writes unless this is set).
+    force: Option<bool>,
 }
 
 // ── server ────────────────────────────────────────────────────────────────────
@@ -170,8 +149,8 @@ impl OrgMcpServer {
     /// optional TODO keyword, tags, and byte range.
     #[tool(description = "Get the document outline (all headlines) of an org file.")]
     async fn outline(&self, Parameters(p): Parameters<OutlineParams>) -> String {
-        match parse_and_run(&p.file, |src, tree| {
-            let entries = outline(src, tree)?;
+        match ops::parse_and_run(&p.file, |src, tree| {
+            let entries = org_parser::outline(src, tree)?;
             Ok(serde_json::to_string_pretty(&entries)?)
         }) {
             Ok(s) => s,
@@ -192,28 +171,14 @@ impl OrgMcpServer {
     /// grammar.
     #[tool(description = "Run a tree-sitter S-expression query against an org file or a directory of org files.")]
     async fn query(&self, Parameters(p): Parameters<QueryParams>) -> String {
-        let patterns = match compile_patterns(p.patterns.as_deref()) {
+        let patterns = match ops::compile_patterns(p.patterns.as_deref().unwrap_or(&[])) {
             Ok(v) => v,
             Err(e) => return error_json(&e.to_string()),
         };
-        if Path::new(&p.path).is_dir() {
-            match search_directory(&p.path, &p.query, &patterns) {
-                Ok(s) => s,
-                Err(e) => error_json(&e.to_string()),
-            }
-        } else {
-            let file = p.path.clone();
-            match parse_and_run(&p.path, |src, tree| {
-                let matches = run_query(src, tree, &p.query, &patterns)?;
-                let file_matches: Vec<FileMatch> = matches
-                    .into_iter()
-                    .map(|m| FileMatch { file: file.clone(), m })
-                    .collect();
-                Ok(serde_json::to_string_pretty(&file_matches)?)
-            }) {
-                Ok(s) => s,
-                Err(e) => error_json(&e.to_string()),
-            }
+        match ops::query_path(&p.path, &p.query, &patterns) {
+            Ok(matches) => serde_json::to_string_pretty(&matches)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
+            Err(e) => error_json(&e.to_string()),
         }
     }
 
@@ -233,8 +198,8 @@ impl OrgMcpServer {
         } else {
             return error_json("provide at least one of custom_id, line, or heading_path");
         };
-        match parse_and_run(&file, |src, tree| {
-            let info = resolve_section_ref(src, tree, &r)?;
+        match ops::parse_and_run(&file, |src, tree| {
+            let info = org_parser::resolve_section_ref(src, tree, &r)?;
             Ok(serde_json::to_string_pretty(&info)?)
         }) {
             Ok(s) => s,
@@ -260,8 +225,9 @@ impl OrgMcpServer {
     ///   [[file:path/to/file.org]]        — whole file, returns {file, content}
     #[tool(description = "Follow an Org-mode link and return structured section metadata (title, depth, custom_id, breadcrumbs, subtree text, resolved file path), or {file, content} for bare file links.")]
     async fn open_link(&self, Parameters(p): Parameters<OpenLinkParams>) -> String {
-        match follow_org_link(&p.link, p.base_file.as_deref()) {
-            Ok(s) => s,
+        match ops::follow_org_link(&p.link, p.base_file.as_deref()) {
+            Ok(target) => serde_json::to_string_pretty(&target)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -269,8 +235,9 @@ impl OrgMcpServer {
     /// Apply a literal search-and-replace within the subtree identified by
     /// `custom_id` (preferred), `line`, or `heading_path`. All occurrences of
     /// `search` are replaced with `replace`. The file is updated in-place.
-    /// Returns the modified subtree text and a unified diff patch.
-    #[tool(description = "Search and replace text within a subtree identified by custom_id (preferred), line, or heading_path, writing the result back to the file. Returns {subtree, patch} where patch is a unified diff.")]
+    /// Returns the modified subtree text and a unified diff patch. Refuses to
+    /// write if the file has an Emacs lock (`.#filename`) unless `force` is set.
+    #[tool(description = "Search and replace text within a subtree identified by custom_id (preferred), line, or heading_path, writing the result back to the file. Returns {subtree, patch} where patch is a unified diff. Blocked by an Emacs lockfile unless force is set.")]
     async fn patch_subtree(&self, Parameters(p): Parameters<PatchSubtreeParams>) -> String {
         let r = if let Some(id) = p.custom_id {
             SectionRef::Id { file: None, id }
@@ -281,13 +248,9 @@ impl OrgMcpServer {
         } else {
             return error_json("provide at least one of custom_id (preferred), line, or heading_path");
         };
-        match run_patch(&p.file, &r, &p.search, &p.replace) {
-            Ok((subtree, patch)) => {
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "subtree": subtree,
-                    "patch": patch,
-                })).unwrap_or_else(|_| error_json("failed to serialize response"))
-            }
+        match ops::run_patch(&p.file, &r, &p.search, &p.replace, p.force.unwrap_or(false)) {
+            Ok(report) => serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -297,10 +260,12 @@ impl OrgMcpServer {
     /// `custom_id` is checked for uniqueness across the file; a `-2`, `-3`, …
     /// suffix is appended if needed. The file is updated in-place when a new ID
     /// is inserted. Returns JSON with `custom_id`, `already_existed`, `patch`.
-    #[tool(description = "Ensure the section at the given 0-indexed line has a :CUSTOM_ID:, inserting one (with automatic disambiguation) if absent.")]
+    /// Refuses to write if the file has an Emacs lock unless `force` is set.
+    #[tool(description = "Ensure the section at the given 0-indexed line has a :CUSTOM_ID:, inserting one (with automatic disambiguation) if absent. Blocked by an Emacs lockfile unless force is set.")]
     async fn ensure_custom_id(&self, Parameters(p): Parameters<EnsureCustomIdParams>) -> String {
-        match run_ensure_custom_id(&p.file, p.line, &p.custom_id) {
-            Ok(s) => s,
+        match ops::run_ensure_custom_id(&p.file, p.line, &p.custom_id, p.force.unwrap_or(false)) {
+            Ok(report) => serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -321,11 +286,13 @@ impl OrgMcpServer {
     /// it is automatically disambiguated (suffix `-2`, `-3`, …).
     ///
     /// Returns `{ src: {file, title}, dest: {file, custom_id, line},
-    ///   custom_id_changed, validation: {errors, warnings} }`.
-    #[tool(description = "Move a section (by CUSTOM_ID, line, or heading_path — CUSTOM_ID preferred) within or between org files, adjusting heading depth and disambiguating CUSTOM_ID collisions automatically.")]
+    ///   custom_id_changed, validation: {errors, warnings} }`. Refuses to write
+    /// if either file has an Emacs lock unless `force` is set.
+    #[tool(description = "Move a section (by CUSTOM_ID, line, or heading_path — CUSTOM_ID preferred) within or between org files, adjusting heading depth and disambiguating CUSTOM_ID collisions automatically. Blocked by an Emacs lockfile on either file unless force is set.")]
     async fn refile_subtree(&self, Parameters(p): Parameters<RefileSubtreeParams>) -> String {
-        match run_refile(&p.src, &p.dest) {
-            Ok(s) => s,
+        match ops::run_refile(&p.src, &p.dest, p.force.unwrap_or(false)) {
+            Ok(report) => serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -336,10 +303,13 @@ impl OrgMcpServer {
     /// always be an absolute path.  The caller is responsible for
     /// depth-adjusting `content` before calling this tool.
     /// Returns `{ dest: {file, line}, validation: {errors, warnings} }`.
-    #[tool(description = "Insert org-mode text at a destination (same placement semantics as refile_subtree). dest.section.file must be set. Caller adjusts heading depth. Returns {dest: {file, line}, validation}.")]
+    /// Refuses to write if the destination file has an Emacs lock unless
+    /// `force` is set.
+    #[tool(description = "Insert org-mode text at a destination (same placement semantics as refile_subtree). dest.section.file must be set. Caller adjusts heading depth. Returns {dest: {file, line}, validation}. Blocked by an Emacs lockfile unless force is set.")]
     async fn insert_subtree(&self, Parameters(p): Parameters<InsertSubtreeParams>) -> String {
-        match run_insert(&p.content, &p.dest) {
-            Ok(s) => s,
+        match ops::run_insert(&p.content, &p.dest, p.force.unwrap_or(false)) {
+            Ok(report) => serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|_| error_json("failed to serialize response")),
             Err(e) => error_json(&e.to_string()),
         }
     }
@@ -378,219 +348,14 @@ or doc_top/doc_bottom at the file root). CUSTOM_ID collisions in the destination
 are auto-disambiguated; the destination line number is returned. Use \
 `insert_subtree` to insert raw org text at a destination (same placement \
 semantics as refile_subtree, but no source section is removed); the caller \
-supplies depth-adjusted content and dest.section.file or dest.file."
+supplies depth-adjusted content and dest.section.file or dest.file. All writing \
+tools (`patch_subtree`, `ensure_custom_id`, `refile_subtree`, `insert_subtree`) \
+refuse to modify a file that currently has an Emacs lock (a `.#filename` lock \
+symlink next to it) unless the `force` parameter is set to true."
 )]
 impl ServerHandler for OrgMcpServer {}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-fn parse_and_run<F, T>(file: &str, f: F) -> anyhow::Result<T>
-where
-    F: FnOnce(&[u8], &tree_sitter::Tree) -> anyhow::Result<T>,
-{
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    f(&source, &tree)
-}
-
-fn compile_patterns(raw: Option<&[String]>) -> anyhow::Result<Vec<Regex>> {
-    raw.unwrap_or(&[])
-        .iter()
-        .map(|p| Regex::new(p).map_err(|e| anyhow::anyhow!("invalid pattern {p:?}: {e}")))
-        .collect()
-}
-
-fn search_directory(dir: &str, query_src: &str, patterns: &[Regex]) -> anyhow::Result<String> {
-    let mut all: Vec<FileMatch> = Vec::new();
-    for path in collect_org_files_in(Path::new(dir))? {
-        let path_str = path.to_string_lossy().to_string();
-        match parse_and_run(&path_str, |src, tree| run_query(src, tree, query_src, patterns)) {
-            Ok(matches) => {
-                for m in matches {
-                    all.push(FileMatch { file: path_str.clone(), m });
-                }
-            }
-            Err(e) => eprintln!("warn: skipping {path_str}: {e}"),
-        }
-    }
-    Ok(serde_json::to_string_pretty(&all)?)
-}
-
-fn collect_org_files_in(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    collect_org_files(dir, &mut files)?;
-    Ok(files)
-}
-
-fn collect_org_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| anyhow::anyhow!("cannot read dir {}: {e}", dir.display()))?
-    {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_org_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("org") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn follow_org_link(link: &str, base_file: Option<&str>) -> anyhow::Result<String> {
-    let resolve = |f: &str| -> anyhow::Result<String> {
-        if Path::new(f).is_absolute() {
-            return Ok(f.to_string());
-        }
-        let base = base_file.ok_or_else(|| {
-            anyhow::anyhow!("base_file required to resolve relative path {f:?}")
-        })?;
-        let base_path = Path::new(base);
-        let base_dir = if base_path.is_dir() {
-            base_path
-        } else {
-            base_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
-        };
-        Ok(base_dir.join(f).to_string_lossy().into_owned())
-    };
-    let require_base = || {
-        base_file
-            .ok_or_else(|| anyhow::anyhow!("base_file required for same-file link"))
-            .map(str::to_string)
-    };
-    match parse_org_link(link)? {
-        OrgLink::Section(r) => {
-            let file = match r.file() {
-                Some(f) => resolve(f)?,
-                None => require_base()?,
-            };
-            let file_for_result = file.clone();
-            parse_and_run(&file, move |src, tree| {
-                let info = resolve_section_ref(src, tree, &r)?;
-                Ok(serde_json::to_string_pretty(&LinkedSection { file: file_for_result, info })?)
-            })
-        }
-        OrgLink::Document(path) => {
-            let file = resolve(&path)?;
-            let content = std::fs::read_to_string(&file)
-                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-            Ok(serde_json::to_string_pretty(&LinkedFile { file, content })?)
-        }
-    }
-}
-
-fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> anyhow::Result<(String, FilePatch)> {
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let (modified_bytes, new_section, patch) = org_patch_subtree(file, &source, &tree, r, search, replace)?;
-    let report = org_validate(&modified_bytes)?;
-    if report.has_errors() {
-        anyhow::bail!(
-            "write aborted — validation errors: {}",
-            report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
-    }
-    std::fs::write(file, &modified_bytes)
-        .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    Ok((new_section, patch))
-}
-
-fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> anyhow::Result<String> {
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let r = SectionRef::Line { file: None, line };
-    let EnsureCustomIdResult { custom_id, file_content, patch, already_existed } =
-        org_ensure_custom_id(&source, &tree, &r, proposed_id)?;
-    if !already_existed {
-        let report = org_validate(&file_content)?;
-        if report.has_errors() {
-            anyhow::bail!(
-                "write aborted — validation errors: {}",
-                report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-            );
-        }
-        std::fs::write(file, &file_content)
-            .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    }
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "custom_id": custom_id,
-        "already_existed": already_existed,
-        "patch": patch,
-    }))?)
-}
-
-fn run_refile(src_ref: &SectionRef, dest: &Dest) -> anyhow::Result<String> {
-    let RefileOutput {
-        src_file,
-        dest_file,
-        src_bytes,
-        dest_bytes,
-        final_custom_id,
-        custom_id_changed,
-        dest_start_line,
-        src_title,
-        validation,
-    } = org_refile_subtree(src_ref, dest)?;
-
-    if validation.has_errors() {
-        anyhow::bail!(
-            "write aborted — validation errors: {}",
-            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
-    }
-
-    let same_file = src_file == dest_file;
-    if same_file {
-        std::fs::write(&dest_file, &dest_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
-    } else {
-        std::fs::write(&src_file, &src_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {src_file}: {e}"))?;
-        std::fs::write(&dest_file, &dest_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
-    }
-
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "src": { "file": src_file, "title": src_title },
-        "dest": {
-            "file": dest_file,
-            "custom_id": final_custom_id,
-            "line": dest_start_line,
-        },
-        "custom_id_changed": custom_id_changed,
-        "validation": validation,
-    }))?)
-}
-
-fn run_insert(content: &str, dest: &Dest) -> anyhow::Result<String> {
-    let InsertOutput { dest_file, dest_bytes, dest_start_line, validation } =
-        org_insert_subtree(content, dest)?;
-    if validation.has_errors() {
-        anyhow::bail!(
-            "write aborted — validation errors: {}",
-            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
-    }
-    std::fs::write(&dest_file, &dest_bytes)
-        .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "dest": { "file": dest_file, "line": dest_start_line },
-        "validation": validation,
-    }))?)
-}
 
 fn error_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()

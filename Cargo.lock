@@ -474,13 +474,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "org-parser",
- "regex",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "tokio",
- "tree-sitter",
 ]
 
 [[package]]
@@ -528,10 +526,8 @@ dependencies = [
  "anyhow",
  "clap",
  "org-parser",
- "regex",
  "serde",
  "serde_json",
- "tree-sitter",
 ]
 
 [[package]]

@@ -15,5 +15,3 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
-tree-sitter = { workspace = true }
-regex = { workspace = true }
