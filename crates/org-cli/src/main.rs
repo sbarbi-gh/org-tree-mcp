@@ -1,28 +1,29 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use regex::Regex;
-use std::path::Path;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 
-use org_parser::{
-    ensure_custom_id as org_ensure_custom_id, insert_subtree as org_insert_subtree,
-    make_parser, outline, parse_org_link,
-    patch_subtree as org_patch_subtree, refile_subtree as org_refile_subtree,
-    resolve_section_ref, run_query, validate as org_validate,
-    Dest, EnsureCustomIdResult, FilePatch, InsertOutput, OrgLink, RefileOutput, SectionRef,
+use org_parser::links::{check_links, find_backlinks, BacklinkHit, BacklinkTarget, LinkCheckError};
+use org_parser::ops::{
+    self, EnsureCustomIdReport, FileMatch, InsertReport, LinkTarget, PatchReport, RefileReport,
 };
+use org_parser::{Dest, HeadlineEntry, SectionInfo, SectionRef, ValidationReport};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "org", about = "Structural navigation and editing of Org mode files")]
 struct Cli {
+    /// Output raw JSON instead of human-readable plain text.
+    #[arg(short = 'j', long = "json", global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List all headlines in an org file (JSON array).
+    /// List all headlines in an org file.
     Outline {
         file: String,
     },
@@ -80,6 +81,9 @@ enum Cmd {
         search: String,
         #[arg(long)]
         replace: String,
+        /// Bypass the Emacs lockfile guardrail.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Insert org-mode text at the specified destination.
@@ -98,6 +102,9 @@ enum Cmd {
         /// Line number of the destination anchor section (alternative to --dest-id).
         #[arg(long)]
         dest_line: Option<usize>,
+        /// Bypass the Emacs lockfile guardrail.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Ensure the section at the given line has a :CUSTOM_ID:, inserting one if absent.
@@ -109,14 +116,24 @@ enum Cmd {
         /// Proposed CUSTOM_ID value (auto-disambiguated with -2/-3/… suffix if taken).
         #[arg(long)]
         id: String,
+        /// Bypass the Emacs lockfile guardrail.
+        #[arg(long)]
+        force: bool,
     },
 
-    /// Move a section (by CUSTOM_ID) within or between org files.
+    /// Move a section within or between org files.
     Refile {
         /// Source file.
         src_file: String,
-        /// CUSTOM_ID of the section to move.
-        src_id: String,
+        /// :CUSTOM_ID: value of the section to move (preferred).
+        #[arg(long = "src-id")]
+        src_id: Option<String>,
+        /// 0-indexed line number of the section to move.
+        #[arg(long = "src-line")]
+        src_line: Option<usize>,
+        /// Heading path of the section to move, one element per level (repeatable).
+        #[arg(long = "src-heading")]
+        src_heading: Vec<String>,
         /// Placement: before|after|first-child|last-child|doc-top|doc-bottom.
         #[arg(long)]
         placement: String,
@@ -131,6 +148,31 @@ enum Cmd {
         /// Line number of the destination anchor section (alternative to --dest-id).
         #[arg(long)]
         dest_line: Option<usize>,
+        /// Bypass the Emacs lockfile guardrail (checked on both src and dest files).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Find every link across a directory of org files that points at a file
+    /// (optionally narrowed to a specific section within it).
+    Backlinks {
+        /// File to find inbound links to.
+        target_file: String,
+        /// Directory to search (recursively).
+        root: String,
+        /// Narrow to links targeting this :CUSTOM_ID: within target_file.
+        #[arg(long)]
+        id: Option<String>,
+        /// Narrow to links targeting this heading path within target_file,
+        /// one element per level (repeatable).
+        #[arg(long = "heading")]
+        heading: Vec<String>,
+    },
+
+    /// Scan a directory of org files for links that fail to resolve.
+    CheckLinks {
+        /// Directory to search (recursively).
+        root: String,
     },
 }
 
@@ -138,259 +180,123 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(e) = run(cli.cmd) {
+    if let Err(e) = run(cli.cmd, cli.json) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(cmd: Cmd) -> Result<()> {
+fn print_output<T: Serialize>(json: bool, value: &T, text: impl FnOnce() -> String) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{}", text());
+    }
+    Ok(())
+}
+
+fn run(cmd: Cmd, json: bool) -> Result<()> {
     match cmd {
         Cmd::Outline { file } => {
-            let out = parse_and_run(&file, |src, tree| {
-                let entries = outline(src, tree)?;
-                Ok(serde_json::to_string_pretty(&entries)?)
-            })?;
-            println!("{out}");
+            let entries: Vec<HeadlineEntry> =
+                ops::parse_and_run(&file, |src, tree| org_parser::outline(src, tree))?;
+            print_output(json, &entries, || render_outline_text(&entries))?;
         }
 
         Cmd::Query { path, query, patterns } => {
-            let compiled = compile_patterns(&patterns)?;
-            let out = if Path::new(&path).is_dir() {
-                search_directory(&path, &query, &compiled)?
-            } else {
-                parse_and_run(&path, |src, tree| {
-                    let matches = run_query(src, tree, &query, &compiled)?;
-                    let with_file: Vec<_> = matches
-                        .into_iter()
-                        .map(|m| {
-                            let mut v = serde_json::to_value(m).unwrap();
-                            v.as_object_mut().unwrap().insert("file".into(), path.clone().into());
-                            v
-                        })
-                        .collect();
-                    Ok(serde_json::to_string_pretty(&with_file)?)
-                })?
-            };
-            println!("{out}");
+            let compiled = ops::compile_patterns(&patterns)?;
+            let matches = ops::query_path(&path, &query, &compiled)?;
+            print_output(json, &matches, || render_query_text(&matches))?;
         }
 
         Cmd::Subtree { file, id, line, heading } => {
-            let r = if let Some(id) = id {
-                SectionRef::Id { file: None, id }
-            } else if let Some(n) = line {
-                SectionRef::Line { file: None, line: n }
-            } else if !heading.is_empty() {
-                SectionRef::Path { file: None, path: heading }
-            } else {
-                bail!("provide at least one of --id, --line, or --heading");
-            };
-            let out = parse_and_run(&file, |src, tree| {
-                let info = resolve_section_ref(src, tree, &r)?;
-                Ok(serde_json::to_string_pretty(&info)?)
+            let r = section_ref_from(None, id, line, heading)?;
+            let info = ops::parse_and_run(&file, |src, tree| {
+                org_parser::resolve_section_ref(src, tree, &r)
             })?;
-            println!("{out}");
+            print_output(json, &info, || render_subtree_text(&info, None))?;
         }
 
         Cmd::OpenLink { link, base } => {
-            let out = follow_org_link(&link, base.as_deref())?;
-            println!("{out}");
+            let target = ops::follow_org_link(&link, base.as_deref())?;
+            print_output(json, &target, || render_open_link_text(&target))?;
         }
 
         Cmd::QueryExamples => {
-            print!("{}", org_parser::QUERY_EXAMPLES);
-        }
-
-        Cmd::PatchSubtree { file, id, line, heading, search, replace } => {
-            let r = if let Some(id) = id {
-                SectionRef::Id { file: None, id }
-            } else if let Some(n) = line {
-                SectionRef::Line { file: None, line: n }
-            } else if !heading.is_empty() {
-                SectionRef::Path { file: None, path: heading }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "content": org_parser::QUERY_EXAMPLES,
+                    }))?
+                );
             } else {
-                bail!("provide at least one of --id (preferred), --line, or --heading");
-            };
-            let (subtree, patch) = run_patch(&file, &r, &search, &replace)?;
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "subtree": subtree,
-                "patch": patch,
-            }))?);
-        }
-
-        Cmd::Insert { content, placement, dest_file, dest_id, dest_line } => {
-            let dest = build_dest(&placement, Some(dest_file), dest_id, dest_line)?;
-            let out = run_insert(&content, &dest)?;
-            println!("{out}");
-        }
-
-        Cmd::EnsureCustomId { file, line, id } => {
-            let out = run_ensure_custom_id(&file, line, &id)?;
-            println!("{out}");
-        }
-
-        Cmd::Refile { src_file, src_id, placement, dest_file, dest_id, dest_line } => {
-            let src = SectionRef::Id { file: Some(src_file), id: src_id };
-            let dest = build_dest(&placement, dest_file, dest_id, dest_line)?;
-            let out = run_refile(&src, &dest)?;
-            println!("{out}");
-        }
-    }
-    Ok(())
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn parse_and_run<F, T>(file: &str, f: F) -> Result<T>
-where
-    F: FnOnce(&[u8], &tree_sitter::Tree) -> Result<T>,
-{
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    f(&source, &tree)
-}
-
-fn compile_patterns(raw: &[String]) -> Result<Vec<Regex>> {
-    raw.iter()
-        .map(|p| Regex::new(p).map_err(|e| anyhow::anyhow!("invalid pattern {p:?}: {e}")))
-        .collect()
-}
-
-fn search_directory(dir: &str, query_src: &str, patterns: &[Regex]) -> Result<String> {
-    let mut all: Vec<serde_json::Value> = Vec::new();
-    for path in collect_org_files(Path::new(dir))? {
-        let path_str = path.to_string_lossy().to_string();
-        match parse_and_run(&path_str, |src, tree| run_query(src, tree, query_src, patterns)) {
-            Ok(matches) => {
-                for m in matches {
-                    let mut v = serde_json::to_value(m)?;
-                    v.as_object_mut().unwrap().insert("file".into(), path_str.clone().into());
-                    all.push(v);
-                }
+                print!("{}", org_parser::QUERY_EXAMPLES);
             }
-            Err(e) => eprintln!("warn: skipping {path_str}: {e}"),
         }
-    }
-    Ok(serde_json::to_string_pretty(&all)?)
-}
 
-fn collect_org_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut files = Vec::new();
-    collect_org_files_rec(dir, &mut files)?;
-    Ok(files)
-}
+        Cmd::PatchSubtree { file, id, line, heading, search, replace, force } => {
+            let r = section_ref_from(None, id, line, heading)?;
+            let report = ops::run_patch(&file, &r, &search, &replace, force)?;
+            print_output(json, &report, || render_patch_text(&report))?;
+        }
 
-fn collect_org_files_rec(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| anyhow::anyhow!("cannot read dir {}: {e}", dir.display()))?
-    {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_org_files_rec(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("org") {
-            out.push(path);
+        Cmd::Insert { content, placement, dest_file, dest_id, dest_line, force } => {
+            let dest = build_dest(&placement, Some(dest_file), dest_id, dest_line)?;
+            let report = ops::run_insert(&content, &dest, force)?;
+            print_output(json, &report, || render_insert_text(&report))?;
+        }
+
+        Cmd::EnsureCustomId { file, line, id, force } => {
+            let report = ops::run_ensure_custom_id(&file, line, &id, force)?;
+            print_output(json, &report, || render_ensure_custom_id_text(&report))?;
+        }
+
+        Cmd::Refile {
+            src_file, src_id, src_line, src_heading,
+            placement, dest_file, dest_id, dest_line, force,
+        } => {
+            let src = section_ref_from(Some(src_file), src_id, src_line, src_heading)?;
+            let dest = build_dest(&placement, dest_file, dest_id, dest_line)?;
+            let report = ops::run_refile(&src, &dest, force)?;
+            print_output(json, &report, || render_refile_text(&report))?;
+        }
+
+        Cmd::Backlinks { target_file, root, id, heading } => {
+            let target = BacklinkTarget {
+                file: PathBuf::from(&target_file),
+                id,
+                heading_path: if heading.is_empty() { None } else { Some(heading) },
+            };
+            let hits = find_backlinks(Path::new(&root), &target)?;
+            print_output(json, &hits, || render_backlinks_text(&hits, &target_file, &root))?;
+        }
+
+        Cmd::CheckLinks { root } => {
+            let errors = check_links(Path::new(&root))?;
+            print_output(json, &errors, || render_check_links_text(&errors, &root))?;
         }
     }
     Ok(())
 }
 
-fn follow_org_link(link: &str, base_file: Option<&str>) -> Result<String> {
-    let resolve = |f: &str| -> Result<String> {
-        if Path::new(f).is_absolute() {
-            return Ok(f.to_string());
-        }
-        let base = base_file
-            .ok_or_else(|| anyhow::anyhow!("--base required to resolve relative path {f:?}"))?;
-        let base_path = Path::new(base);
-        let base_dir = if base_path.is_dir() {
-            base_path
-        } else {
-            base_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("cannot determine parent dir of {base:?}"))?
-        };
-        Ok(base_dir.join(f).to_string_lossy().into_owned())
-    };
-    let require_base = || {
-        base_file
-            .ok_or_else(|| anyhow::anyhow!("--base required for same-file link"))
-            .map(str::to_string)
-    };
-    match parse_org_link(link)? {
-        OrgLink::Section(r) => {
-            let file = match r.file() {
-                Some(f) => resolve(f)?,
-                None => require_base()?,
-            };
-            let file_for_result = file.clone();
-            parse_and_run(&file, move |src, tree| {
-                let info = resolve_section_ref(src, tree, &r)?;
-                let mut v = serde_json::to_value(info)?;
-                v.as_object_mut().unwrap().insert("file".into(), file_for_result.into());
-                Ok(serde_json::to_string_pretty(&v)?)
-            })
-        }
-        OrgLink::Document(path) => {
-            let file = resolve(&path)?;
-            let content = std::fs::read_to_string(&file)
-                .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-            Ok(serde_json::to_string_pretty(
-                &serde_json::json!({ "file": file, "content": content }),
-            )?)
-        }
-    }
-}
+// ── arg helpers ───────────────────────────────────────────────────────────────
 
-fn run_patch(file: &str, r: &SectionRef, search: &str, replace: &str) -> Result<(String, FilePatch)> {
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let (modified_bytes, new_section, patch) = org_patch_subtree(file, &source, &tree, r, search, replace)?;
-    let report = org_validate(&modified_bytes)?;
-    if report.has_errors() {
-        bail!(
-            "write aborted — validation errors: {}",
-            report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
+fn section_ref_from(
+    file: Option<String>,
+    id: Option<String>,
+    line: Option<usize>,
+    heading: Vec<String>,
+) -> Result<SectionRef> {
+    if let Some(id) = id {
+        Ok(SectionRef::Id { file, id })
+    } else if let Some(n) = line {
+        Ok(SectionRef::Line { file, line: n })
+    } else if !heading.is_empty() {
+        Ok(SectionRef::Path { file, path: heading })
+    } else {
+        bail!("provide at least one of --id (preferred), --line, or --heading")
     }
-    std::fs::write(file, &modified_bytes)
-        .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    Ok((new_section, patch))
-}
-
-fn run_ensure_custom_id(file: &str, line: usize, proposed_id: &str) -> Result<String> {
-    let source = std::fs::read(file)
-        .map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
-    let mut parser = make_parser()?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse {file}"))?;
-    let r = SectionRef::Line { file: None, line };
-    let EnsureCustomIdResult { custom_id, file_content, patch, already_existed } =
-        org_ensure_custom_id(&source, &tree, &r, proposed_id)?;
-    if !already_existed {
-        let report = org_validate(&file_content)?;
-        if report.has_errors() {
-            bail!(
-                "write aborted — validation errors: {}",
-                report.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-            );
-        }
-        std::fs::write(file, &file_content)
-            .map_err(|e| anyhow::anyhow!("cannot write {file}: {e}"))?;
-    }
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "custom_id": custom_id,
-        "already_existed": already_existed,
-        "patch": patch,
-    }))?)
 }
 
 fn build_dest(
@@ -409,71 +315,175 @@ fn build_dest(
         }
     };
     match placement {
-        "before"      => Ok(Dest::Before     { section: anchor_ref("before")? }),
-        "after"       => Ok(Dest::After      { section: anchor_ref("after")? }),
+        "before" => Ok(Dest::Before { section: anchor_ref("before")? }),
+        "after" => Ok(Dest::After { section: anchor_ref("after")? }),
         "first-child" => Ok(Dest::FirstChild { section: anchor_ref("first-child")? }),
-        "last-child"  => Ok(Dest::LastChild  { section: anchor_ref("last-child")? }),
-        "doc-top"     => Ok(Dest::DocTop     { file: dest_file }),
-        "doc-bottom"  => Ok(Dest::DocBottom  { file: dest_file }),
-        other => bail!("unknown placement {other:?}; use before|after|first-child|last-child|doc-top|doc-bottom"),
+        "last-child" => Ok(Dest::LastChild { section: anchor_ref("last-child")? }),
+        "doc-top" => Ok(Dest::DocTop { file: dest_file }),
+        "doc-bottom" => Ok(Dest::DocBottom { file: dest_file }),
+        other => bail!(
+            "unknown placement {other:?}; use before|after|first-child|last-child|doc-top|doc-bottom"
+        ),
     }
 }
 
-fn run_refile(src_ref: &SectionRef, dest: &Dest) -> Result<String> {
-    let RefileOutput {
-        src_file,
-        dest_file,
-        src_bytes,
-        dest_bytes,
-        final_custom_id,
-        custom_id_changed,
-        dest_start_line,
-        src_title,
-        validation,
-    } = org_refile_subtree(src_ref, dest)?;
+// ── plain-text renderers ──────────────────────────────────────────────────────
+//
+// Plain text renders 1-indexed line numbers for human readability; JSON output
+// (via print_output's `value` branch) keeps the underlying 0-indexed values
+// unchanged — a deliberate, documented asymmetry.
 
-    if validation.has_errors() {
-        bail!(
-            "write aborted — validation errors: {}",
-            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
+fn render_outline_text(entries: &[HeadlineEntry]) -> String {
+    if entries.is_empty() {
+        return "(no headlines)".to_string();
     }
+    entries
+        .iter()
+        .map(|e| {
+            let stars = "*".repeat(e.depth);
+            let kw = e.todo_keyword.as_ref().map(|k| format!("{k} ")).unwrap_or_default();
+            let tags = if e.tags.is_empty() {
+                String::new()
+            } else {
+                format!("  :{}:", e.tags.join(":"))
+            };
+            format!("{stars} {kw}{}{tags}  (row {})", e.title, e.start_position.row + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    if src_file == dest_file {
-        std::fs::write(&dest_file, &dest_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
+fn indent(s: &str, prefix: &str) -> String {
+    s.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+}
+
+fn render_query_text(matches: &[FileMatch]) -> String {
+    if matches.is_empty() {
+        return "(no matches)".to_string();
+    }
+    matches
+        .iter()
+        .map(|fm| {
+            let m = &fm.m;
+            let bc = if m.breadcrumbs.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", m.breadcrumbs.join(" > "))
+            };
+            let first_line = m.text.lines().next().unwrap_or("");
+            let mut out = format!(
+                "{}:{}  [{}]{bc}\n    text: {first_line}",
+                fm.file,
+                m.start_position.row + 1,
+                m.capture
+            );
+            if let Some(ctx) = &m.context {
+                out.push_str(&format!("\n    context:\n{}", indent(ctx, "      ")));
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_subtree_text(info: &SectionInfo, file: Option<&str>) -> String {
+    let mut header = String::new();
+    if let Some(f) = file {
+        header.push_str(&format!("File: {f}\n"));
+    }
+    let bc = if info.breadcrumbs.is_empty() {
+        String::new()
     } else {
-        std::fs::write(&src_file, &src_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {src_file}: {e}"))?;
-        std::fs::write(&dest_file, &dest_bytes)
-            .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
-    }
-
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "src": { "file": src_file, "title": src_title },
-        "dest": {
-            "file": dest_file,
-            "custom_id": final_custom_id,
-            "line": dest_start_line,
-        },
-        "custom_id_changed": custom_id_changed,
-        "validation": validation,
-    }))?)
+        format!("{} > ", info.breadcrumbs.join(" > "))
+    };
+    let id_part = info.custom_id.as_ref().map(|id| format!(", id={id}")).unwrap_or_default();
+    header.push_str(&format!(
+        "=== {bc}{}  (depth {}, row {}{id_part}) ===\n",
+        info.title,
+        info.depth,
+        info.start_line + 1
+    ));
+    format!("{header}{}", info.subtree)
 }
 
-fn run_insert(content: &str, dest: &Dest) -> Result<String> {
-    let InsertOutput { dest_file, dest_bytes, dest_start_line, validation } =
-        org_insert_subtree(content, dest)?;
-    if validation.has_errors() {
-        bail!(
-            "write aborted — validation errors: {}",
-            validation.errors.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")
-        );
+fn render_open_link_text(target: &LinkTarget) -> String {
+    match target {
+        LinkTarget::Section(s) => render_subtree_text(&s.info, Some(&s.file)),
+        LinkTarget::Document(d) => format!("File: {}\n\n{}", d.file, d.content),
     }
-    std::fs::write(&dest_file, &dest_bytes)
-        .map_err(|e| anyhow::anyhow!("cannot write {dest_file}: {e}"))?;
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "dest": { "file": dest_file, "line": dest_start_line },
-        "validation": validation,
-    }))?)
+}
+
+fn render_patch_text(report: &PatchReport) -> String {
+    report.patch.diff.clone()
+}
+
+fn render_ensure_custom_id_text(report: &EnsureCustomIdReport) -> String {
+    let status = if report.already_existed { "already existed" } else { "inserted" };
+    let mut out = format!("CUSTOM_ID: {} ({status})", report.custom_id);
+    if let Some(patch) = &report.patch {
+        out.push('\n');
+        out.push_str(&patch.diff);
+    }
+    out
+}
+
+fn render_warnings(v: &ValidationReport) -> String {
+    if v.warnings.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> =
+            v.warnings.iter().map(|d| format!("warning: {}", d.message)).collect();
+        format!("\n{}", lines.join("\n"))
+    }
+}
+
+fn render_refile_text(report: &RefileReport) -> String {
+    let mut out = format!(
+        "Moved \"{}\" from {} to {}:{}",
+        report.src.title,
+        report.src.file,
+        report.dest.file,
+        report.dest.line + 1
+    );
+    let id_part = report.dest.custom_id.as_deref().unwrap_or("<none>");
+    out.push_str(&format!("\ncustom_id: {id_part}"));
+    if report.custom_id_changed {
+        out.push_str(" (renamed to avoid collision)");
+    }
+    out.push_str(&render_warnings(&report.validation));
+    out
+}
+
+fn render_insert_text(report: &InsertReport) -> String {
+    let mut out = format!("Inserted at {}:{}", report.dest.file, report.dest.line + 1);
+    out.push_str(&render_warnings(&report.validation));
+    out
+}
+
+fn render_backlinks_text(hits: &[BacklinkHit], target_file: &str, root: &str) -> String {
+    if hits.is_empty() {
+        return format!("no backlinks to {target_file} found under {root}");
+    }
+    hits.iter()
+        .map(|h| {
+            let bc = if h.breadcrumbs.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", h.breadcrumbs.join(" > "))
+            };
+            format!("{}:{}{bc}  {}", h.source_file.display(), h.line + 1, h.link_text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_check_links_text(errors: &[LinkCheckError], root: &str) -> String {
+    if errors.is_empty() {
+        return format!("no broken links found under {root}");
+    }
+    errors
+        .iter()
+        .map(|e| format!("{}:{}  {}  — {}", e.source_file.display(), e.line + 1, e.link_text, e.error))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

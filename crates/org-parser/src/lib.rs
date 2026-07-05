@@ -1,7 +1,11 @@
+pub mod links;
+pub mod lock;
+pub mod ops;
 pub mod parser;
 pub mod query;
 pub mod types;
 
+pub use lock::check_not_locked;
 pub use parser::make_parser;
 pub use query::{
     ensure_custom_id, insert_subtree, outline, parse_org_link, patch_subtree, refile_subtree,

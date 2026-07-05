@@ -12,6 +12,4 @@ org-parser = { path = "../org-parser" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-regex = { workspace = true }
 clap = { workspace = true }
-tree-sitter = { workspace = true }

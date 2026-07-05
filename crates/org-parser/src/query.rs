@@ -57,11 +57,11 @@ fn position(p: tree_sitter::Point) -> Position {
     Position { row: p.row, column: p.column }
 }
 
-fn byte_range(n: &Node) -> ByteRange {
+pub(crate) fn byte_range(n: &Node) -> ByteRange {
     ByteRange { start: n.start_byte(), end: n.end_byte() }
 }
 
-fn breadcrumbs(node: Node, source: &[u8]) -> Vec<String> {
+pub(crate) fn breadcrumbs(node: Node, source: &[u8]) -> Vec<String> {
     let mut crumbs = Vec::new();
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -131,7 +131,7 @@ fn make_cursor(scm: &str) -> Result<(Query, QueryCursor)> {
 
 /// Execute `scm` rooted at `node`, invoking `f` with the first non-internal
 /// capture of each match. Return `None` from `f` to skip a match.
-fn query_nodes<'tree, T>(
+pub(crate) fn query_nodes<'tree, T>(
     source: &[u8],
     node: Node<'tree>,
     scm: &str,
